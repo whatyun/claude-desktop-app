@@ -31,7 +31,7 @@ export interface DocumentInfo {
   filename: string;
   url: string;
   content?: string;
-  format?: 'markdown' | 'docx' | 'pptx' | 'xlsx' | 'pdf';
+  format?: string;
   slides?: SlideInfo[];
   sheets?: SheetInfo[];
   sections?: PdfSection[];
@@ -48,12 +48,27 @@ const DocumentCard: React.FC<DocumentCardProps> = ({ document, onOpen }) => {
 
   const handleDownload = async (e: React.MouseEvent) => {
     e.stopPropagation();
-    if (fmt === 'markdown') {
-      const blob = new Blob([document.content || ''], { type: 'text/markdown;charset=utf-8' });
+    const binaryFormats = ['docx', 'pptx', 'xlsx', 'pdf'];
+    if (!binaryFormats.includes(fmt)) {
+      // Text-based: markdown or code files — download from content
+      const langToExt: Record<string, string> = {
+        markdown: 'md', python: 'py', javascript: 'js', typescript: 'ts',
+        java: 'java', c: 'c', cpp: 'cpp', csharp: 'cs',
+        go: 'go', rust: 'rs', ruby: 'rb', php: 'php',
+        swift: 'swift', kotlin: 'kt', scala: 'scala',
+        html: 'html', css: 'css', scss: 'scss',
+        sql: 'sql', shell: 'sh', bash: 'sh', powershell: 'ps1',
+        yaml: 'yml', json: 'json', xml: 'xml', toml: 'toml',
+        ini: 'ini', dockerfile: 'Dockerfile',
+        r: 'r', matlab: 'm', lua: 'lua', perl: 'pl',
+        dart: 'dart', vue: 'vue', svelte: 'svelte',
+      };
+      const ext = langToExt[fmt] || fmt;
+      const blob = new Blob([document.content || ''], { type: 'text/plain;charset=utf-8' });
       const url = URL.createObjectURL(blob);
       const a = window.document.createElement('a');
       a.href = url;
-      a.download = `${document.title}.md`;
+      a.download = document.title.includes('.') ? document.title : `${document.title}.${ext}`;
       a.click();
       URL.revokeObjectURL(url);
     } else {

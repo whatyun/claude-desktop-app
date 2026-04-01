@@ -1,0 +1,1296 @@
+const express = require('express');
+const cors = require('cors');
+const multer = require('multer');
+const path = require('path');
+const fs = require('fs');
+const os = require('os');
+const { v4: uuidv4 } = require('uuid');
+const { app } = require('electron');
+const { TOOL_DEFINITIONS, executeTool } = require('./tools.cjs');
+
+// No longer needed — SDK removed, using direct API calls
+function enableNodeModeForChildProcesses() {
+    console.log('[Engine] Direct API mode — no SDK subprocess needed');
+}
+
+// Load custom system prompt (only affects this Electron app, not external CLI usage)
+const CUSTOM_SYSTEM_PROMPT_PATH = path.join(__dirname, 'system-prompt.txt');
+let customSystemPrompt = '';
+try {
+    if (fs.existsSync(CUSTOM_SYSTEM_PROMPT_PATH)) {
+        customSystemPrompt = fs.readFileSync(CUSTOM_SYSTEM_PROMPT_PATH, 'utf8');
+        console.log(`[System Prompt] Loaded custom prompt (${customSystemPrompt.length} chars) from ${CUSTOM_SYSTEM_PROMPT_PATH}`);
+    } else {
+        console.warn('[System Prompt] Custom prompt file not found at:', CUSTOM_SYSTEM_PROMPT_PATH);
+    }
+} catch (e) {
+    console.error('[System Prompt] Failed to load:', e.message);
+}
+
+function initServer(mainWindow) {
+    const server = express();
+    server.use(cors());
+    server.use(express.json());
+
+    // Setup paths
+    const userDataPath = app.getPath('userData');
+    const dbPath = path.join(userDataPath, 'claude-desktop.json');
+    const workspacesDir = path.join(userDataPath, 'workspaces');
+
+    if (!fs.existsSync(workspacesDir)) {
+        fs.mkdirSync(workspacesDir, { recursive: true });
+    }
+
+    // Initialize DB
+    let db = { conversations: [], messages: [], projects: [], project_files: [] };
+    if (fs.existsSync(dbPath)) {
+        try {
+            const loaded = JSON.parse(fs.readFileSync(dbPath, 'utf8'));
+            db = { ...db, ...loaded };
+            // Ensure new arrays exist for older DB files
+            if (!db.projects) db.projects = [];
+            if (!db.project_files) db.project_files = [];
+        } catch (e) { }
+    }
+    const saveDb = () => fs.writeFileSync(dbPath, JSON.stringify(db, null, 2));
+
+    async function generateTitleAsync(conversationId, userMsg, assistantMsg, token, baseUrl, activeModel) {
+        if (!token) { console.log('[Title] Skipped: no API token'); return; }
+        try {
+            const bConv = db.conversations.find(c => c.id === conversationId);
+            if (!bConv || (bConv.title !== 'New Conversation' && bConv.title !== 'New Chat')) return;
+
+            // Strip -thinking suffix — raw API doesn't accept it
+            let modelId = (activeModel || 'claude-sonnet-4-6').replace(/-thinking$/, '');
+
+            // Build endpoint: handle base URLs that already contain /v1
+            let endpoint;
+            if (baseUrl) {
+                const clean = baseUrl.replace(/\/+$/, '');
+                endpoint = clean.endsWith('/v1') ? `${clean}/messages` : `${clean}/v1/messages`;
+            } else {
+                endpoint = 'https://api.anthropic.com/v1/messages';
+            }
+
+            console.log(`[Title] Generating for ${conversationId} via ${endpoint} model=${modelId}`);
+            const response = await fetch(endpoint, {
+                method: 'POST',
+                headers: {
+                    'content-type': 'application/json',
+                    'x-api-key': token,
+                    'anthropic-version': '2023-06-01'
+                },
+                body: JSON.stringify({
+                    model: modelId,
+                    max_tokens: 50,
+                    system: 'You are a title generator. Respond only with the title, without any quotes or explanations. Maximum 5-7 words.',
+                    messages: [
+                        { role: 'user', content: `请根据这段对话生成一个简短的标题（最多5-7个字，不要用引号），概括对话的主题：\n\n用户：${userMsg}\n助手：${assistantMsg}\n\n标题：` }
+                    ]
+                })
+            });
+            if (response.ok) {
+                const data = await response.json();
+                let title = null;
+                if (data.content && Array.isArray(data.content)) {
+                    const textBlock = data.content.find(b => b.type === 'text' && b.text);
+                    if (textBlock && textBlock.text) {
+                        title = textBlock.text.replace(/^["']|["']$/g, '').trim();
+                    }
+                }
+                if (title) {
+                    bConv.title = title;
+                    saveDb();
+                    console.log(`[Title] Success: "${title}"`);
+                } else {
+                    console.error('[Title] No text in response:', JSON.stringify(data));
+                }
+            } else {
+                console.error('[Title] HTTP Error:', response.status, endpoint, await response.text());
+            }
+        } catch (e) {
+            console.error('[Title] Exception:', e.message || e);
+        }
+    }
+
+    // ═══════════════════ Projects ═══════════════════
+
+    server.get('/api/projects', (req, res) => {
+        const list = [...db.projects]
+            .filter(p => !p.is_archived)
+            .sort((a, b) => new Date(b.updated_at || b.created_at) - new Date(a.updated_at || a.created_at));
+        // Attach counts
+        const result = list.map(p => ({
+            ...p,
+            file_count: db.project_files.filter(f => f.project_id === p.id).length,
+            chat_count: db.conversations.filter(c => c.project_id === p.id).length,
+        }));
+        res.json(result);
+    });
+
+    server.post('/api/projects', (req, res) => {
+        const id = uuidv4();
+        const { name, description = '' } = req.body;
+        if (!name || !name.trim()) return res.status(400).json({ error: 'Name required' });
+
+        const projectDir = path.join(workspacesDir, `project-${id}`);
+        if (!fs.existsSync(projectDir)) fs.mkdirSync(projectDir, { recursive: true });
+
+        const project = {
+            id, name: name.trim(), description: description.trim(),
+            instructions: '', workspace_path: projectDir,
+            is_archived: 0, created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
+        };
+        db.projects.push(project);
+        saveDb();
+        res.json(project);
+    });
+
+    server.get('/api/projects/:id', (req, res) => {
+        const project = db.projects.find(p => p.id === req.params.id);
+        if (!project) return res.status(404).json({ error: 'Project not found' });
+
+        const files = db.project_files.filter(f => f.project_id === project.id)
+            .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+        const conversations = db.conversations.filter(c => c.project_id === project.id)
+            .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+
+        res.json({ ...project, files, conversations });
+    });
+
+    server.patch('/api/projects/:id', (req, res) => {
+        const project = db.projects.find(p => p.id === req.params.id);
+        if (!project) return res.status(404).json({ error: 'Project not found' });
+
+        if (req.body.name !== undefined) project.name = req.body.name.trim();
+        if (req.body.description !== undefined) project.description = req.body.description;
+        if (req.body.instructions !== undefined) project.instructions = req.body.instructions;
+        if (req.body.is_archived !== undefined) project.is_archived = req.body.is_archived;
+        project.updated_at = new Date().toISOString();
+
+        saveDb();
+        res.json(project);
+    });
+
+    server.delete('/api/projects/:id', (req, res) => {
+        const pid = req.params.id;
+        // Delete project files from disk
+        const files = db.project_files.filter(f => f.project_id === pid);
+        for (const f of files) {
+            if (f.file_path && fs.existsSync(f.file_path)) {
+                try { fs.unlinkSync(f.file_path); } catch (_) {}
+            }
+        }
+        db.project_files = db.project_files.filter(f => f.project_id !== pid);
+
+        // Delete project conversations + messages + workspaces
+        const convIds = db.conversations.filter(c => c.project_id === pid).map(c => c.id);
+        db.messages = db.messages.filter(m => !convIds.includes(m.conversation_id));
+        db.conversations = db.conversations.filter(c => c.project_id !== pid);
+        for (const cid of convIds) {
+            const wsPath = path.join(workspacesDir, cid);
+            if (fs.existsSync(wsPath)) try { fs.rmSync(wsPath, { recursive: true, force: true }); } catch (_) {}
+        }
+
+        // Delete project dir
+        const projectDir = path.join(workspacesDir, `project-${pid}`);
+        if (fs.existsSync(projectDir)) try { fs.rmSync(projectDir, { recursive: true, force: true }); } catch (_) {}
+
+        db.projects = db.projects.filter(p => p.id !== pid);
+        saveDb();
+        res.json({ success: true });
+    });
+
+    // ═══ Project file upload ═══
+    const projectUploadStorage = multer.diskStorage({
+        destination: (req, file, cb) => {
+            const project = db.projects.find(p => p.id === req.params.id);
+            const dir = project ? path.join(project.workspace_path, 'files') : path.join(workspacesDir, 'temp');
+            if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+            cb(null, dir);
+        },
+        filename: (req, file, cb) => cb(null, Date.now() + '-' + file.originalname),
+    });
+    const projectUpload = multer({ storage: projectUploadStorage });
+
+    server.post('/api/projects/:id/files', projectUpload.single('file'), (req, res) => {
+        const project = db.projects.find(p => p.id === req.params.id);
+        if (!project) return res.status(404).json({ error: 'Project not found' });
+        if (!req.file) return res.status(400).json({ error: 'No file' });
+
+        // Extract text for known text formats
+        let extractedText = '';
+        const textExts = ['.txt', '.md', '.json', '.xml', '.yaml', '.yml', '.csv', '.html', '.css', '.js', '.ts', '.tsx', '.jsx', '.py', '.java', '.c', '.cpp', '.h', '.go', '.rs', '.rb', '.php', '.sql', '.sh', '.lua', '.r'];
+        const ext = path.extname(req.file.originalname).toLowerCase();
+        if (textExts.includes(ext)) {
+            try { extractedText = fs.readFileSync(req.file.path, 'utf8'); } catch (_) {}
+        }
+
+        const fileEntry = {
+            id: uuidv4(),
+            project_id: project.id,
+            file_name: req.file.originalname,
+            file_path: req.file.path,
+            file_size: req.file.size,
+            mime_type: req.file.mimetype,
+            extracted_text: extractedText,
+            created_at: new Date().toISOString(),
+        };
+        db.project_files.push(fileEntry);
+        project.updated_at = new Date().toISOString();
+        saveDb();
+
+        res.json({ ...fileEntry, extracted_text: undefined }); // Don't send full text back
+    });
+
+    server.delete('/api/projects/:projectId/files/:fileId', (req, res) => {
+        const file = db.project_files.find(f => f.id === req.params.fileId && f.project_id === req.params.projectId);
+        if (!file) return res.status(404).json({ error: 'File not found' });
+
+        if (file.file_path && fs.existsSync(file.file_path)) {
+            try { fs.unlinkSync(file.file_path); } catch (_) {}
+        }
+        db.project_files = db.project_files.filter(f => f.id !== file.id);
+        const project = db.projects.find(p => p.id === req.params.projectId);
+        if (project) project.updated_at = new Date().toISOString();
+        saveDb();
+        res.json({ success: true });
+    });
+
+    // ═══ Project conversations ═══
+    server.get('/api/projects/:id/conversations', (req, res) => {
+        const convs = db.conversations.filter(c => c.project_id === req.params.id)
+            .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+        res.json(convs);
+    });
+
+    server.post('/api/projects/:id/conversations', (req, res) => {
+        const project = db.projects.find(p => p.id === req.params.id);
+        if (!project) return res.status(404).json({ error: 'Project not found' });
+
+        const id = uuidv4();
+        const { title = 'New Conversation', model = 'claude-sonnet-4-6' } = req.body;
+        const workspacePath = path.join(workspacesDir, id);
+        if (!fs.existsSync(workspacePath)) fs.mkdirSync(workspacePath, { recursive: true });
+
+        // Copy project files into workspace so SDK can read them
+        const projectFiles = db.project_files.filter(f => f.project_id === project.id);
+        for (const pf of projectFiles) {
+            if (pf.file_path && fs.existsSync(pf.file_path)) {
+                try { fs.copyFileSync(pf.file_path, path.join(workspacePath, pf.file_name)); } catch (_) {}
+            }
+        }
+
+        const newConv = {
+            id, title, model, project_id: project.id,
+            workspace_path: workspacePath, created_at: new Date().toISOString(),
+        };
+        db.conversations.push(newConv);
+        project.updated_at = new Date().toISOString();
+        saveDb();
+        res.json(newConv);
+    });
+
+    // ═══════════════════ Conversations ═══════════════════
+
+    server.get('/api/conversations', (req, res) => {
+        // Filter: only return non-project conversations (project convs accessed via /projects/:id/conversations)
+        const projectId = req.query.project_id;
+        let list;
+        if (projectId) {
+            list = db.conversations.filter(c => c.project_id === projectId);
+        } else {
+            list = db.conversations.filter(c => !c.project_id);
+        }
+        list = [...list].sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+        res.json(list);
+    });
+
+    server.post('/api/conversations', (req, res) => {
+        const id = uuidv4();
+        const { title = 'New Conversation', model = 'claude-3-5-sonnet', project_id } = req.body;
+        const workspacePath = path.join(workspacesDir, id);
+
+        if (!fs.existsSync(workspacePath)) {
+            fs.mkdirSync(workspacePath, { recursive: true });
+        }
+
+        // If creating under a project, copy project files into workspace
+        if (project_id) {
+            const project = db.projects.find(p => p.id === project_id);
+            if (project) {
+                const projectFiles = db.project_files.filter(f => f.project_id === project_id);
+                for (const pf of projectFiles) {
+                    if (pf.file_path && fs.existsSync(pf.file_path)) {
+                        try { fs.copyFileSync(pf.file_path, path.join(workspacePath, pf.file_name)); } catch (_) {}
+                    }
+                }
+            }
+        }
+
+        const newConv = {
+            id, title, model, workspace_path: workspacePath, created_at: new Date().toISOString(),
+            ...(project_id ? { project_id } : {}),
+        };
+        db.conversations.push(newConv);
+        saveDb();
+
+        res.json({ id, title, model, workspace_path: workspacePath });
+    });
+
+    server.get('/api/conversations/:id', (req, res) => {
+        const conv = db.conversations.find(c => c.id === req.params.id);
+        if (!conv) return res.status(404).json({ error: 'Not found' });
+
+        const messages = db.messages.filter(m => m.conversation_id === req.params.id)
+            .sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
+
+        const parsedMessages = messages.map(m => {
+            let contentStr = '';
+            try {
+                const parsed = JSON.parse(m.content);
+                if (Array.isArray(parsed)) {
+                    contentStr = parsed.map(c => c.text || '').join('');
+                } else if (typeof parsed === 'string') {
+                    contentStr = parsed;
+                } else {
+                    contentStr = m.content;
+                }
+            } catch (e) {
+                contentStr = m.content;
+            }
+            return {
+                ...m,
+                content: contentStr
+            };
+        });
+
+        res.json({
+            ...conv,
+            messages: parsedMessages
+        });
+    });
+
+    server.patch('/api/conversations/:id', (req, res) => {
+        const conv = db.conversations.find(c => c.id === req.params.id);
+        if (!conv) return res.status(404).json({ error: 'Not found' });
+
+        if (req.body.title) conv.title = req.body.title;
+        if (req.body.model) conv.model = req.body.model;
+
+        saveDb();
+        res.json(conv);
+    });
+
+    server.delete('/api/conversations/:id', (req, res) => {
+        const id = req.params.id;
+        db.messages = db.messages.filter(m => m.conversation_id !== id);
+        db.conversations = db.conversations.filter(c => c.id !== id);
+        saveDb();
+        // Also delete the workspace folder from disk
+        const wsPath = path.join(workspacesDir, id);
+        if (fs.existsSync(wsPath)) {
+            try {
+                fs.rmSync(wsPath, { recursive: true, force: true });
+                console.log(`[Delete] Removed workspace: ${wsPath}`);
+            } catch (e) {
+                console.error(`[Delete] Failed to remove workspace: ${e.message}`);
+            }
+        }
+        res.json({ success: true });
+    });
+
+    server.delete('/api/conversations/:id/messages/:messageId', (req, res) => {
+        const { id, messageId } = req.params;
+        const msgIndex = db.messages.findIndex(m => m.id === messageId && m.conversation_id === id);
+        if (msgIndex === -1) return res.status(404).json({ error: 'Message not found' });
+
+        // Remove this message and all subsequent messages in the conversation
+        const targetCreatedAt = new Date(db.messages[msgIndex].created_at).getTime();
+        db.messages = db.messages.filter(m => {
+            if (m.conversation_id !== id) return true;
+            return new Date(m.created_at).getTime() < targetCreatedAt;
+        });
+        saveDb();
+        res.json({ success: true });
+    });
+
+    server.delete('/api/conversations/:id/messages-tail/:count', (req, res) => {
+        const { id, count } = req.params;
+        const numToRemove = parseInt(count, 10);
+        if (isNaN(numToRemove) || numToRemove <= 0) return res.status(400).json({ error: 'Invalid count' });
+
+        const convMsgs = db.messages.filter(m => m.conversation_id === id).sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
+        if (convMsgs.length <= numToRemove) {
+            db.messages = db.messages.filter(m => m.conversation_id !== id);
+        } else {
+            const cutoffTime = new Date(convMsgs[convMsgs.length - numToRemove].created_at).getTime();
+            db.messages = db.messages.filter(m => {
+                if (m.conversation_id !== id) return true;
+                return new Date(m.created_at).getTime() < cutoffTime;
+            });
+        }
+        saveDb();
+        res.json({ success: true });
+    });
+
+    // Multer upload config
+    const storage = multer.diskStorage({
+        destination: (req, file, cb) => {
+            const convId = req.headers['x-conversation-id'] || 'temp';
+            const dir = path.join(workspacesDir, convId, '.uploads');
+            if (!fs.existsSync(dir)) {
+                fs.mkdirSync(dir, { recursive: true });
+            }
+            cb(null, dir);
+        },
+        filename: (req, file, cb) => {
+            cb(null, Date.now() + '-' + file.originalname);
+        }
+    });
+    const upload = multer({ storage });
+
+    server.post('/api/upload', upload.single('file'), (req, res) => {
+        if (!req.file) return res.status(400).json({ error: 'No file' });
+        res.json({
+            fileId: path.basename(req.file.path),
+            fileName: req.file.originalname,
+            fileType: req.file.mimetype.startsWith('image') ? 'image' : 'document',
+            mimeType: req.file.mimetype,
+            localPath: req.file.path,
+            size: req.file.size
+        });
+    });
+
+    // Resolve a fileId to its local path and serve the raw file
+    server.get('/api/uploads/:fileId/raw', (req, res) => {
+        const fileId = req.params.fileId;
+        const convId = req.query.conversation_id || '';
+        // Search in conversation uploads first, then all workspaces
+        const searchDirs = [];
+        if (convId) searchDirs.push(path.join(workspacesDir, convId, '.uploads'));
+        // Also search all conversation upload dirs
+        try {
+            const allConvDirs = fs.readdirSync(workspacesDir);
+            for (const dir of allConvDirs) {
+                const uploadsDir = path.join(workspacesDir, dir, '.uploads');
+                if (fs.existsSync(uploadsDir)) searchDirs.push(uploadsDir);
+            }
+        } catch (_) {}
+
+        for (const dir of searchDirs) {
+            const filePath = path.join(dir, fileId);
+            if (fs.existsSync(filePath)) {
+                return res.sendFile(filePath);
+            }
+            // Try partial match
+            try {
+                const files = fs.readdirSync(dir);
+                const match = files.find(f => f === fileId || f.includes(fileId));
+                if (match) return res.sendFile(path.join(dir, match));
+            } catch (_) {}
+        }
+        res.status(404).json({ error: 'File not found' });
+    });
+
+    // Get local file path for a fileId
+    server.get('/api/uploads/:fileId/path', (req, res) => {
+        const fileId = req.params.fileId;
+        const convId = req.query.conversation_id || '';
+        const searchDirs = [];
+        if (convId) searchDirs.push(path.join(workspacesDir, convId, '.uploads'));
+        try {
+            const allConvDirs = fs.readdirSync(workspacesDir);
+            for (const dir of allConvDirs) {
+                const uploadsDir = path.join(workspacesDir, dir, '.uploads');
+                if (fs.existsSync(uploadsDir)) searchDirs.push(uploadsDir);
+            }
+        } catch (_) {}
+
+        for (const dir of searchDirs) {
+            const filePath = path.join(dir, fileId);
+            if (fs.existsSync(filePath)) {
+                return res.json({ localPath: filePath, folder: dir });
+            }
+            try {
+                const files = fs.readdirSync(dir);
+                const match = files.find(f => f === fileId || f.includes(fileId));
+                if (match) return res.json({ localPath: path.join(dir, match), folder: dir });
+            } catch (_) {}
+        }
+        res.status(404).json({ error: 'File not found' });
+    });
+
+    // Compact conversation — summarize history to reduce context size
+    server.post('/api/conversations/:id/compact', async (req, res) => {
+        const conv = db.conversations.find(c => c.id === req.params.id);
+        if (!conv) return res.status(404).json({ error: 'Conversation not found' });
+
+        const convMessages = db.messages
+            .filter(m => m.conversation_id === req.params.id)
+            .sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
+        if (convMessages.length < 3) {
+            return res.status(400).json({ error: 'Not enough messages to compact' });
+        }
+
+        const env_token = req.body.env_token;
+        const env_base_url = req.body.env_base_url;
+        const apiKey = env_token || process.env.ANTHROPIC_API_KEY;
+        const baseUrl = env_base_url || process.env.ANTHROPIC_BASE_URL;
+
+        try {
+            // Build a text summary of the conversation for the compaction prompt
+            let historyText = '';
+            for (const m of convMessages) {
+                const parsed = JSON.parse(m.content || '[]');
+                const text = parsed.map(b => b.text || '').join('').slice(0, 500);
+                historyText += `[${m.role}]: ${text}\n`;
+            }
+            historyText = historyText.slice(0, 20000); // Cap at ~5K tokens
+
+            let modelId = (conv.model || 'claude-sonnet-4-6').replace(/-thinking$/, '');
+            let endpoint = baseUrl ? `${baseUrl.replace(/\/+$/, '')}/v1/messages` : 'https://api.anthropic.com/v1/messages';
+            if (baseUrl && baseUrl.replace(/\/+$/, '').endsWith('/v1')) endpoint = `${baseUrl.replace(/\/+$/, '')}/messages`;
+
+            const response = await fetch(endpoint, {
+                method: 'POST',
+                headers: { 'content-type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
+                body: JSON.stringify({
+                    model: modelId,
+                    max_tokens: 2000,
+                    system: 'You are a conversation summarizer. Summarize the following conversation history concisely, preserving key decisions, code changes, and context needed to continue the conversation. Respond in the same language as the conversation.',
+                    messages: [{ role: 'user', content: historyText }]
+                })
+            });
+
+            let compactSummary = 'Conversation compacted.';
+            if (response.ok) {
+                const data = await response.json();
+                const textBlock = (data.content || []).find(b => b.type === 'text');
+                if (textBlock?.text) compactSummary = textBlock.text;
+            }
+
+            const messagesCompacted = convMessages.length;
+            const totalChars = convMessages.reduce((sum, m) => sum + (m.content || '').length + (m.thinking || '').length, 0);
+            const tokensSaved = Math.round(totalChars / 4 * 0.7);
+
+            // Replace all old messages with the summary
+            db.messages = db.messages.filter(m => m.conversation_id !== req.params.id);
+            db.messages.push({
+                id: uuidv4(),
+                conversation_id: req.params.id,
+                role: 'assistant',
+                content: JSON.stringify([{ type: 'text', text: compactSummary }]),
+                created_at: new Date().toISOString(),
+                is_summary: 1,
+            });
+            // Also clear the API history file
+            const historyPath = path.join(conv.workspace_path, '.api_history.json');
+            if (fs.existsSync(historyPath)) fs.unlinkSync(historyPath);
+            saveDb();
+
+            console.log(`[Compact] Done: ${messagesCompacted} messages compacted, ~${tokensSaved} tokens saved`);
+            res.json({ summary: compactSummary, tokensSaved, messagesCompacted });
+        } catch (err) {
+            console.error('[Compact] Error:', err);
+            res.status(500).json({ error: err.message || 'Compaction failed' });
+        }
+    });
+
+    // ===== Skills =====
+    // Paths
+    const bundledSkillsDir = path.join(__dirname, 'skills');
+    const homeDir = os.homedir();
+    const localSkillsDir = path.join(homeDir, '.agents', 'skills');
+    const userSkillsDir = path.join(userDataPath, 'user-skills');
+    const skillPrefsPath = path.join(userDataPath, 'skill-preferences.json');
+
+    if (!fs.existsSync(userSkillsDir)) {
+        fs.mkdirSync(userSkillsDir, { recursive: true });
+    }
+
+    // Load / save skill preferences (enabled/disabled per skill id)
+    function loadSkillPrefs() {
+        if (fs.existsSync(skillPrefsPath)) {
+            try { return JSON.parse(fs.readFileSync(skillPrefsPath, 'utf8')); } catch (e) { }
+        }
+        return {};
+    }
+    function saveSkillPrefs(prefs) {
+        fs.writeFileSync(skillPrefsPath, JSON.stringify(prefs, null, 2));
+    }
+
+    // Parse SKILL.md frontmatter
+    function parseSkillMd(content) {
+        const match = content.replace(/\r\n/g, '\n').match(/^---\n([\s\S]*?)\n---\n?([\s\S]*)$/);
+        if (!match) return null;
+        const fm = match[1];
+        const body = match[2].trim();
+        const nameMatch = fm.match(/^name:\s*(.+)$/m);
+        const descMatch = fm.match(/^description:\s*(.+)$/m);
+        return {
+            name: nameMatch ? nameMatch[1].trim() : null,
+            description: descMatch ? descMatch[1].trim() : '',
+            content: body
+        };
+    }
+
+    // Scan a directory for skill folders (each containing SKILL.md)
+    function scanSkillsDir(dir, source) {
+        const skills = [];
+        if (!fs.existsSync(dir)) return skills;
+        try {
+            const entries = fs.readdirSync(dir, { withFileTypes: true });
+            for (const entry of entries) {
+                if (!entry.isDirectory()) continue;
+                const mdPath = path.join(dir, entry.name, 'SKILL.md');
+                if (!fs.existsSync(mdPath)) continue;
+                try {
+                    const raw = fs.readFileSync(mdPath, 'utf8');
+                    const parsed = parseSkillMd(raw);
+                    if (!parsed) continue;
+                    skills.push({
+                        id: `${source}:${entry.name}`,
+                        name: parsed.name || entry.name,
+                        description: parsed.description,
+                        content: parsed.content,
+                        is_example: true,
+                        source_dir: entry.name,
+                        source: source,
+                        user_id: null,
+                        created_at: null
+                    });
+                } catch (e) { /* skip unreadable */ }
+            }
+        } catch (e) { /* dir not readable */ }
+        return skills;
+    }
+
+    // Load user-created skills (stored as JSON files in userSkillsDir)
+    function loadUserSkills() {
+        const skills = [];
+        if (!fs.existsSync(userSkillsDir)) return skills;
+        try {
+            const files = fs.readdirSync(userSkillsDir).filter(f => f.endsWith('.json'));
+            for (const f of files) {
+                try {
+                    const data = JSON.parse(fs.readFileSync(path.join(userSkillsDir, f), 'utf8'));
+                    skills.push(data);
+                } catch (e) { /* skip */ }
+            }
+        } catch (e) { }
+        return skills;
+    }
+
+    // GET /api/skills — list all skills
+    server.get('/api/skills', (req, res) => {
+        const prefs = loadSkillPrefs();
+
+        // 1) Bundled example skills
+        const bundled = scanSkillsDir(bundledSkillsDir, 'bundled');
+        // 2) Local ~/.agents/skills/
+        const local = scanSkillsDir(localSkillsDir, 'local');
+        // Combine examples, deduplicate by name (bundled takes priority)
+        const seenNames = new Set();
+        const allExamples = [];
+        for (const s of bundled) {
+            seenNames.add(s.name);
+            allExamples.push({ ...s, enabled: prefs[s.id] !== undefined ? prefs[s.id] : false });
+        }
+        for (const s of local) {
+            if (seenNames.has(s.name)) continue;
+            seenNames.add(s.name);
+            allExamples.push({ ...s, enabled: prefs[s.id] !== undefined ? prefs[s.id] : false });
+        }
+
+        // 3) User-created skills
+        const userSkills = loadUserSkills().map(s => ({
+            ...s,
+            enabled: prefs[s.id] !== undefined ? prefs[s.id] : true
+        }));
+
+        // Strip content from list response (only return on detail)
+        const stripContent = (s) => {
+            const { content, ...rest } = s;
+            return rest;
+        };
+
+        res.json({
+            examples: allExamples.map(stripContent),
+            my_skills: userSkills.map(stripContent)
+        });
+    });
+
+    // GET /api/skills/:id — skill detail with content
+    server.get('/api/skills/:id', (req, res) => {
+        const { id } = req.params;
+        const prefs = loadSkillPrefs();
+
+        // Check bundled
+        const bundled = scanSkillsDir(bundledSkillsDir, 'bundled');
+        const local = scanSkillsDir(localSkillsDir, 'local');
+        const allExamples = [...bundled, ...local];
+        const example = allExamples.find(s => s.id === id);
+        if (example) {
+            return res.json({ ...example, enabled: prefs[id] !== undefined ? prefs[id] : false });
+        }
+
+        // Check user skills
+        const userSkills = loadUserSkills();
+        const userSkill = userSkills.find(s => s.id === id);
+        if (userSkill) {
+            return res.json({ ...userSkill, enabled: prefs[id] !== undefined ? prefs[id] : true });
+        }
+
+        res.status(404).json({ error: 'Skill not found' });
+    });
+
+    // POST /api/skills — create user skill
+    server.post('/api/skills', (req, res) => {
+        const { name, description, content } = req.body;
+        if (!name) return res.status(400).json({ error: 'Name is required' });
+
+        const id = uuidv4();
+        const skill = {
+            id,
+            name,
+            description: description || '',
+            content: content || '',
+            is_example: false,
+            source_dir: null,
+            source: 'user',
+            user_id: 'local',
+            created_at: new Date().toISOString()
+        };
+        fs.writeFileSync(path.join(userSkillsDir, `${id}.json`), JSON.stringify(skill, null, 2));
+
+        // Auto-enable
+        const prefs = loadSkillPrefs();
+        prefs[id] = true;
+        saveSkillPrefs(prefs);
+
+        res.json({ ...skill, enabled: true });
+    });
+
+    // PATCH /api/skills/:id — update user skill
+    server.patch('/api/skills/:id', (req, res) => {
+        const { id } = req.params;
+        const filePath = path.join(userSkillsDir, `${id}.json`);
+        if (!fs.existsSync(filePath)) {
+            return res.status(404).json({ error: 'Skill not found or not editable' });
+        }
+        try {
+            const skill = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+            if (req.body.name !== undefined) skill.name = req.body.name;
+            if (req.body.description !== undefined) skill.description = req.body.description;
+            if (req.body.content !== undefined) skill.content = req.body.content;
+            skill.updated_at = new Date().toISOString();
+            fs.writeFileSync(filePath, JSON.stringify(skill, null, 2));
+
+            const prefs = loadSkillPrefs();
+            res.json({ ...skill, enabled: prefs[id] !== undefined ? prefs[id] : true });
+        } catch (e) {
+            res.status(500).json({ error: e.message });
+        }
+    });
+
+    // DELETE /api/skills/:id — delete user skill
+    server.delete('/api/skills/:id', (req, res) => {
+        const { id } = req.params;
+        const filePath = path.join(userSkillsDir, `${id}.json`);
+        if (!fs.existsSync(filePath)) {
+            return res.status(404).json({ error: 'Skill not found' });
+        }
+        fs.unlinkSync(filePath);
+        const prefs = loadSkillPrefs();
+        delete prefs[id];
+        saveSkillPrefs(prefs);
+        res.json({ ok: true });
+    });
+
+    // PATCH /api/skills/:id/toggle — toggle enabled state
+    server.patch('/api/skills/:id/toggle', (req, res) => {
+        const { id } = req.params;
+        const { enabled } = req.body;
+        const prefs = loadSkillPrefs();
+        prefs[id] = !!enabled;
+        saveSkillPrefs(prefs);
+        res.json({ ok: true, enabled: !!enabled });
+    });
+
+    // Get all enabled skills with full content (for UseSkill tool)
+    function getAllEnabledSkills() {
+        const prefs = loadSkillPrefs();
+        const enabledIds = Object.keys(prefs).filter(id => prefs[id]);
+        if (enabledIds.length === 0) return [];
+        const allSkills = [
+            ...scanSkillsDir(bundledSkillsDir, 'bundled'),
+            ...scanSkillsDir(localSkillsDir, 'local'),
+            ...loadUserSkills()
+        ];
+        return allSkills.filter(s => enabledIds.includes(s.id));
+    }
+
+    // Build lightweight skills index for system prompt (names + descriptions only)
+    function getEnabledSkillsBlock() {
+        const prefs = loadSkillPrefs();
+        const enabledIds = Object.keys(prefs).filter(id => prefs[id]);
+        console.log(`[Skills] Prefs:`, JSON.stringify(prefs), `Enabled IDs:`, enabledIds);
+        if (enabledIds.length === 0) return '';
+
+        const allSkills = [
+            ...scanSkillsDir(bundledSkillsDir, 'bundled'),
+            ...scanSkillsDir(localSkillsDir, 'local'),
+            ...loadUserSkills()
+        ];
+
+        console.log(`[Skills] All scanned:`, allSkills.map(s => s.id));
+        const enabled = allSkills.filter(s => enabledIds.includes(s.id));
+        console.log(`[Skills] Matched enabled:`, enabled.map(s => s.id));
+        if (enabled.length === 0) return '';
+
+        // Only inject skill INDEX (name + description) into system prompt.
+        // Full content is loaded on demand via the UseSkill tool.
+        let block = `<available_skills>
+You have the following skills available. When a user's request matches a skill's description, you MUST use it by calling the UseSkill tool with the skill name to load its full instructions, then follow those instructions precisely.
+
+`;
+        for (const s of enabled) {
+            block += `- **${s.name}**: ${s.description}\n`;
+        }
+        block += `\nTo use a skill, call the UseSkill tool with the skill name. The tool will return the full skill instructions for you to follow.\n</available_skills>`;
+        console.log(`[Skills] ${enabled.length} skill(s) indexed in system prompt`);
+        return block;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  CHAT ENDPOINT — Direct Anthropic API with Agentic Loop
+    // ═══════════════════════════════════════════════════════════
+
+    // Helper: build API endpoint URL from base
+    function buildApiEndpoint(baseUrl) {
+        if (!baseUrl) return 'https://api.anthropic.com/v1/messages';
+        const clean = baseUrl.replace(/\/+$/, '');
+        return clean.endsWith('/v1') ? `${clean}/messages` : `${clean}/v1/messages`;
+    }
+
+    // Helper: load/save API message history for a conversation
+    function loadApiHistory(workspacePath) {
+        const p = path.join(workspacePath, '.api_history.json');
+        if (fs.existsSync(p)) {
+            try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { }
+        }
+        return [];
+    }
+    function saveApiHistory(workspacePath, messages) {
+        // Limit size: keep last ~60 messages to stay under context limits
+        const MAX_MSGS = 60;
+        const trimmed = messages.length > MAX_MSGS ? messages.slice(-MAX_MSGS) : messages;
+        // Ensure first message is user role (API requirement)
+        let start = 0;
+        while (start < trimmed.length && trimmed[start].role !== 'user') start++;
+        const final = trimmed.slice(start);
+        fs.writeFileSync(path.join(workspacePath, '.api_history.json'), JSON.stringify(final, null, 0), 'utf8');
+    }
+
+    // Helper: stream one API round, returns parsed response
+    async function streamApiRound(endpoint, apiKey, model, systemPrompt, messages, tools, thinkingEnabled, sendSSE) {
+        console.log(`[API] model=${model} thinking=${thinkingEnabled} systemPrompt=${systemPrompt ? systemPrompt.length + ' chars' : 'NONE'} messages=${messages.length} tools=${tools.length}`);
+        const body = {
+            model,
+            system: systemPrompt || undefined,
+            messages,
+            tools: tools.length > 0 ? tools : undefined,
+            max_tokens: thinkingEnabled ? 16000 : 8192,
+            stream: true,
+        };
+        if (thinkingEnabled) {
+            body.thinking = { type: 'enabled', budget_tokens: 10000 };
+        }
+
+        const response = await fetch(endpoint, {
+            method: 'POST',
+            headers: {
+                'content-type': 'application/json',
+                'x-api-key': apiKey,
+                'anthropic-version': '2023-06-01',
+            },
+            body: JSON.stringify(body),
+        });
+
+        if (!response.ok) {
+            const errText = await response.text().catch(() => '');
+            let errMsg = `API Error ${response.status}`;
+            try { const j = JSON.parse(errText); errMsg = j.error?.message || j.error || errMsg; } catch { if (errText) errMsg += `: ${errText.slice(0, 300)}`; }
+            throw new Error(errMsg);
+        }
+
+        // Parse SSE stream
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let sseBuffer = '';
+        let assistantText = '';
+        let thinkingText = '';
+        const contentBlocks = []; // accumulate full content blocks
+        const blockAccumulators = {}; // index → { type, data }
+        let stopReason = null;
+        let usage = {};
+
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+
+            sseBuffer += decoder.decode(value, { stream: true });
+            const lines = sseBuffer.split('\n');
+            sseBuffer = lines.pop() || '';
+
+            for (const line of lines) {
+                if (!line.startsWith('data: ')) continue;
+                const data = line.slice(6).trim();
+                if (data === '[DONE]') continue;
+
+                let parsed;
+                try { parsed = JSON.parse(data); } catch { continue; }
+
+                switch (parsed.type) {
+                    case 'content_block_start': {
+                        const idx = parsed.index;
+                        const block = parsed.content_block;
+                        if (block.type === 'text') {
+                            blockAccumulators[idx] = { type: 'text', text: '' };
+                        } else if (block.type === 'thinking') {
+                            blockAccumulators[idx] = { type: 'thinking', thinking: '' };
+                        } else if (block.type === 'tool_use') {
+                            blockAccumulators[idx] = { type: 'tool_use', id: block.id, name: block.name, inputJson: '' };
+                        }
+                        break;
+                    }
+                    case 'content_block_delta': {
+                        const idx = parsed.index;
+                        const delta = parsed.delta;
+                        const acc = blockAccumulators[idx];
+                        if (!acc) break;
+
+                        if (delta.type === 'text_delta' && delta.text) {
+                            acc.text += delta.text;
+                            assistantText += delta.text;
+                            // Forward to frontend — REAL streaming!
+                            sendSSE({ type: 'content_block_delta', delta: { type: 'text_delta', text: delta.text } });
+                        } else if (delta.type === 'thinking_delta' && delta.thinking) {
+                            acc.thinking += delta.thinking;
+                            thinkingText += delta.thinking;
+                            sendSSE({ type: 'content_block_delta', delta: { type: 'thinking_delta', thinking: delta.thinking } });
+                        } else if (delta.type === 'input_json_delta' && delta.partial_json) {
+                            acc.inputJson += delta.partial_json;
+                        }
+                        break;
+                    }
+                    case 'content_block_stop': {
+                        const idx = parsed.index;
+                        const acc = blockAccumulators[idx];
+                        if (!acc) break;
+
+                        if (acc.type === 'text') {
+                            contentBlocks.push({ type: 'text', text: acc.text });
+                        } else if (acc.type === 'thinking') {
+                            contentBlocks.push({ type: 'thinking', thinking: acc.thinking });
+                        } else if (acc.type === 'tool_use') {
+                            let input = {};
+                            try { input = JSON.parse(acc.inputJson); } catch { }
+                            contentBlocks.push({ type: 'tool_use', id: acc.id, name: acc.name, input });
+                            // Notify frontend
+                            sendSSE({ type: 'tool_use_start', tool_use_id: acc.id, tool_name: acc.name, tool_input: input });
+                            console.log(`[Tool] ${acc.name}`, JSON.stringify(input).slice(0, 150));
+                        }
+                        delete blockAccumulators[idx];
+                        break;
+                    }
+                    case 'message_delta': {
+                        if (parsed.delta?.stop_reason) stopReason = parsed.delta.stop_reason;
+                        if (parsed.usage) usage = { ...usage, ...parsed.usage };
+                        break;
+                    }
+                }
+            }
+        }
+
+        return { contentBlocks, assistantText, thinkingText, stopReason, usage };
+    }
+
+    server.post('/api/chat', async (req, res) => {
+        const { conversation_id, message, attachments, env_token, env_base_url } = req.body;
+        const conv = db.conversations.find(c => c.id === conversation_id);
+        if (!conv) return res.status(404).json({ error: 'Conversation not found' });
+
+        res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.setHeader('Connection', 'keep-alive');
+
+        const sendSSE = (data) => {
+            res.write(`data: ${JSON.stringify(data)}\n\n`);
+        };
+
+        try {
+            // ── 1. Handle attachments ──
+            let finalPrompt = message;
+            if (attachments && attachments.length > 0) {
+                const copiedFiles = [];
+                for (const att of attachments) {
+                    let srcPath = att.localPath;
+                    if (!srcPath && att.fileId) {
+                        const searchDirs = [
+                            path.join(workspacesDir, conversation_id, '.uploads'),
+                            path.join(workspacesDir, 'temp', '.uploads'),
+                        ];
+                        for (const uploadsDir of searchDirs) {
+                            if (srcPath) break;
+                            if (fs.existsSync(uploadsDir)) {
+                                const files = fs.readdirSync(uploadsDir);
+                                const match = files.find(f => f === att.fileId || f.includes(att.fileId));
+                                if (match) srcPath = path.join(uploadsDir, match);
+                            }
+                        }
+                    }
+                    if (srcPath && fs.existsSync(srcPath)) {
+                        const fileName = att.fileName || path.basename(srcPath);
+                        try {
+                            fs.copyFileSync(srcPath, path.join(conv.workspace_path, fileName));
+                            copiedFiles.push(fileName);
+                        } catch (e) { console.error(`[Attachment] Copy failed: ${e.message}`); }
+                    }
+                }
+                if (copiedFiles.length > 0) {
+                    finalPrompt += '\n\n[The user has attached the following files to the current workspace directory. They are available for you to read if relevant. Do NOT read all of them upfront — only read specific files when needed.]\n';
+                    for (const fn of copiedFiles) finalPrompt += `- ./${fn}\n`;
+                }
+            }
+
+            // ── 2. Save user message to display DB ──
+            const combinedUserContent = [{ type: 'text', text: message }];
+            db.messages.push({
+                id: uuidv4(),
+                conversation_id,
+                role: 'user',
+                content: JSON.stringify(combinedUserContent),
+                created_at: new Date().toISOString(),
+                attachments: attachments?.length > 0 ? attachments.map(a => ({ fileId: a.fileId, fileName: a.fileName, fileType: a.fileType, mimeType: a.mimeType, size: a.size })) : undefined
+            });
+            saveDb();
+
+            // ── 3. Build system prompt ──
+            let finalSystemPrompt = customSystemPrompt || '';
+
+            if (conv.project_id) {
+                const project = db.projects.find(p => p.id === conv.project_id);
+                if (project) {
+                    if (project.instructions?.trim()) {
+                        finalSystemPrompt += `\n\n<project_instructions>\n${project.instructions.trim()}\n</project_instructions>`;
+                    }
+                    const projectFiles = db.project_files.filter(f => f.project_id === project.id);
+                    if (projectFiles.length > 0) {
+                        const MAX_TOTAL_CHARS = 80000;
+                        const filesWithText = projectFiles.filter(f => f.extracted_text);
+                        const totalTextSize = filesWithText.reduce((sum, f) => sum + (f.extracted_text?.length || 0), 0);
+                        if (totalTextSize <= MAX_TOTAL_CHARS && filesWithText.length > 0) {
+                            let ctx = '\n\n<project_knowledge_base>\nThe following files have been uploaded to this project as reference material:\n';
+                            for (const pf of filesWithText) ctx += `\n--- ${pf.file_name} ---\n${pf.extracted_text}\n`;
+                            ctx += '</project_knowledge_base>';
+                            finalSystemPrompt += ctx;
+                        } else {
+                            let ctx = '\n\n<project_knowledge_base>\n';
+                            ctx += `This project has ${projectFiles.length} uploaded file(s) in the workspace. Use Read to access them. File list:\n`;
+                            for (const pf of projectFiles) ctx += `- ${pf.file_name} (${Math.round((pf.file_size || 0) / 1024)} KB)\n`;
+                            ctx += 'Only read files relevant to the question.\n</project_knowledge_base>';
+                            finalSystemPrompt += ctx;
+                        }
+                    }
+                }
+            }
+            // Build skills index (lightweight — only names and descriptions)
+            const skillsBlock = getEnabledSkillsBlock();
+            if (skillsBlock) finalSystemPrompt += '\n\n' + skillsBlock;
+
+            // Build tool list: base tools + UseSkill (if any skills are enabled)
+            const enabledSkillsList = getAllEnabledSkills();
+            const allTools = [...TOOL_DEFINITIONS];
+            if (enabledSkillsList.length > 0) {
+                allTools.push({
+                    name: 'UseSkill',
+                    description: 'Load the full instructions of an enabled skill by name. Call this when the user\'s request matches a skill description. The returned instructions must be followed precisely.',
+                    input_schema: {
+                        type: 'object',
+                        properties: {
+                            skill_name: { type: 'string', description: 'The name of the skill to load (e.g. "skill-creator")' }
+                        },
+                        required: ['skill_name']
+                    }
+                });
+            }
+
+            // ── 4. Prepare API call ──
+            const apiKey = env_token || process.env.ANTHROPIC_API_KEY;
+            const baseUrl = env_base_url || process.env.ANTHROPIC_BASE_URL;
+            const endpoint = buildApiEndpoint(baseUrl);
+            const rawModel = conv.model || 'claude-sonnet-4-6';
+            const thinkingEnabled = rawModel.endsWith('-thinking');
+            const modelId = rawModel.replace(/-thinking$/, '');
+
+            // Load conversation API history and append user message
+            let apiMessages = loadApiHistory(conv.workspace_path);
+            apiMessages.push({ role: 'user', content: finalPrompt });
+
+            // ── 5. Agentic Loop ──
+            const MAX_ROUNDS = 25;
+            const MAX_NETWORK_RETRIES = 2;
+            const NETWORK_ERR_RE = /ECONNRESET|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|socket hang up|fetch failed/i;
+            let totalAssistantText = '';
+            let totalThinkingText = '';
+            const allToolCalls = new Map();
+
+            for (let round = 0; round < MAX_ROUNDS; round++) {
+                let roundResult;
+
+                // Retry loop for transient network errors
+                for (let retry = 0; retry <= MAX_NETWORK_RETRIES; retry++) {
+                    try {
+                        roundResult = await streamApiRound(
+                            endpoint, apiKey, modelId, finalSystemPrompt,
+                            apiMessages, allTools, thinkingEnabled, sendSSE
+                        );
+                        break; // success
+                    } catch (err) {
+                        const errMsg = err.message || '';
+                        // Prompt too long: trim history and retry
+                        if (/prompt is too long|too many tokens|context.*length/i.test(errMsg) && apiMessages.length > 2) {
+                            console.log(`[Chat] Prompt too long, trimming history (was ${apiMessages.length} msgs)...`);
+                            sendSSE({ type: 'status', message: '对话上下文过长，正在裁剪历史并重试...' });
+                            // Keep first msg + last 6 messages
+                            apiMessages = [apiMessages[0], ...apiMessages.slice(-6)];
+                            // Ensure alternating roles
+                            if (apiMessages[0].role !== 'user') apiMessages.shift();
+                            continue;
+                        }
+                        // Network error: retry with delay
+                        if (NETWORK_ERR_RE.test(errMsg) && retry < MAX_NETWORK_RETRIES) {
+                            const delay = (retry + 1) * 3;
+                            console.log(`[Chat] Network error, retry ${retry + 1}/${MAX_NETWORK_RETRIES} in ${delay}s...`);
+                            sendSSE({ type: 'status', message: `网络连接异常，${delay}秒后自动重试 (${retry + 1}/${MAX_NETWORK_RETRIES})...` });
+                            await new Promise(r => setTimeout(r, delay * 1000));
+                            continue;
+                        }
+                        throw err; // non-recoverable
+                    }
+                }
+
+                if (!roundResult) throw new Error('Failed after retries');
+
+                totalAssistantText += roundResult.assistantText;
+                totalThinkingText += roundResult.thinkingText;
+
+                // Append assistant response to API history
+                const assistantContent = roundResult.contentBlocks.filter(b => b.type !== 'thinking');
+                apiMessages.push({ role: 'assistant', content: assistantContent });
+
+                // ── Handle stop reasons ──
+                if (roundResult.stopReason === 'end_turn' || roundResult.stopReason === 'stop_sequence') {
+                    break; // Done!
+                }
+
+                if (roundResult.stopReason === 'max_tokens') {
+                    // Auto-continue
+                    apiMessages.push({ role: 'user', content: '继续' });
+                    continue;
+                }
+
+                if (roundResult.stopReason === 'tool_use') {
+                    // Execute each tool and collect results
+                    const toolUseBlocks = roundResult.contentBlocks.filter(b => b.type === 'tool_use');
+                    const toolResults = [];
+
+                    for (const tu of toolUseBlocks) {
+                        let result;
+                        if (tu.name === 'UseSkill') {
+                            // Handle UseSkill: look up skill content by name
+                            const skillName = tu.input?.skill_name || '';
+                            const skill = enabledSkillsList.find(s => s.name === skillName);
+                            if (skill) {
+                                console.log(`[Skill] Loaded "${skillName}" (${(skill.content || '').length} chars)`);
+                                result = { content: skill.content || 'Skill has no content.' };
+                            } else {
+                                result = { content: `Skill "${skillName}" not found. Available: ${enabledSkillsList.map(s => s.name).join(', ')}`, is_error: true };
+                            }
+                        } else {
+                            result = await executeTool(tu.name, tu.input, conv.workspace_path);
+                        }
+                        const resultContent = result.content || '';
+
+                        // Track for frontend display
+                        allToolCalls.set(tu.id, {
+                            id: tu.id,
+                            name: tu.name,
+                            input: tu.input,
+                            status: result.is_error ? 'error' : 'done',
+                            result: resultContent
+                        });
+
+                        // Notify frontend
+                        sendSSE({
+                            type: 'tool_use_done',
+                            tool_use_id: tu.id,
+                            content: resultContent.slice(0, 50000), // Cap for frontend display
+                            is_error: result.is_error || false,
+                        });
+
+                        toolResults.push({
+                            type: 'tool_result',
+                            tool_use_id: tu.id,
+                            content: resultContent,
+                            is_error: result.is_error || false,
+                        });
+                    }
+
+                    // Append tool results to API history and continue loop
+                    apiMessages.push({ role: 'user', content: toolResults });
+                    continue;
+                }
+
+                // Unknown stop reason — break
+                break;
+            }
+
+            // ── 6. Save results ──
+            saveApiHistory(conv.workspace_path, apiMessages);
+
+            if (totalAssistantText || totalThinkingText || allToolCalls.size > 0) {
+                db.messages.push({
+                    id: uuidv4(),
+                    conversation_id,
+                    role: 'assistant',
+                    content: JSON.stringify([{ type: 'text', text: totalAssistantText }]),
+                    created_at: new Date().toISOString(),
+                    thinking: totalThinkingText || undefined,
+                    toolCalls: allToolCalls.size > 0 ? Array.from(allToolCalls.values()) : undefined
+                });
+                saveDb();
+                generateTitleAsync(conversation_id, message.slice(0, 300), totalAssistantText.slice(0, 300), apiKey, baseUrl, conv.model);
+            }
+
+            sendSSE({ type: 'message_stop' });
+            res.write('data: [DONE]\n\n');
+            res.end();
+        } catch (err) {
+            console.error('[Chat] Error:', err);
+            const errMsg = err.message || '';
+            if (/ECONNRESET|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|fetch failed/i.test(errMsg)) {
+                sendSSE({ type: 'error', error: `网络连接失败 (${errMsg.slice(0, 60)})。请检查：1) 网络是否正常  2) 如使用代理，确认代理覆盖了本应用  3) 防火墙是否放行` });
+            } else {
+                sendSSE({ type: 'error', error: errMsg });
+            }
+            res.end();
+        }
+    });
+
+    return server;
+}
+
+module.exports = { initServer, enableNodeModeForChildProcesses };

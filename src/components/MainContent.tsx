@@ -3,21 +3,77 @@ import { ChevronDown, FileText, ArrowUp, RotateCcw, Pencil, Copy, Check, Papercl
 import { useParams, useNavigate, useLocation } from 'react-router-dom';
 import { IconPlus, IconVoice, IconPencil } from './Icons';
 import ClaudeLogo from './ClaudeLogo';
-import { getConversation, sendMessage, createConversation, getUser, updateConversation, deleteMessagesFrom, uploadFile, deleteAttachment, compactConversation, getUserUsage, getAttachmentUrl, getGenerationStatus, stopGeneration } from '../api';
+import { getConversation, sendMessage, createConversation, getUser, updateConversation, deleteMessagesFrom, deleteMessagesTail, uploadFile, deleteAttachment, compactConversation, getUserUsage, getAttachmentUrl, getGenerationStatus, stopGeneration, getContextSize, getUserModels } from '../api';
 import MarkdownRenderer from './MarkdownRenderer';
-import ModelSelector from './ModelSelector';
+import ModelSelector, { SelectableModel } from './ModelSelector';
 import FileUploadPreview, { PendingFile } from './FileUploadPreview';
 import MessageAttachments from './MessageAttachments';
 import DocumentCard, { DocumentInfo } from './DocumentCard';
 import { copyToClipboard } from '../utils/clipboard';
 import SearchProcess from './SearchProcess';
+import DocumentCreationProcess, { DocumentDraftInfo } from './DocumentCreationProcess';
 import CodeExecution from './CodeExecution';
+import ToolDiffView, { shouldUseDiffView, hasExpandableContent, getToolStats } from './ToolDiffView';
 import { executeCode, sendCodeResult, setStatusCallback } from '../pyodideRunner';
+
+function formatChatError(err: string): string {
+  const lower = (err || '').toLowerCase();
+  if (lower.includes('quota_exceeded') || lower.includes('额度已用完') || lower.includes('额度已用尽') || lower.includes('时段额度') || lower.includes('周期额度')) {
+    return '⚠️ 当前额度已用完，请等待额度重置后再试。你可以在设置页查看额度详情。';
+  }
+  if (lower.includes('订阅已过期') || lower.includes('未激活') || lower.includes('inactive') || lower.includes('expired')) {
+    return '⚠️ 你的订阅已过期或未激活，请续费后继续使用。';
+  }
+  if (lower.includes('invalid api key') || lower.includes('authentication')) {
+    return '⚠️ API 认证失败，请重新登录。';
+  }
+  if (lower.includes('overloaded') || lower.includes('rate limit') || lower.includes('529')) {
+    return '⚠️ 服务暂时繁忙，请稍后再试。';
+  }
+  return 'Error: ' + err;
+}
+
+const CompactingStatus = () => {
+  const [progress, setProgress] = useState(0);
+
+  useEffect(() => {
+    // Fake progress animation
+    const interval = setInterval(() => {
+      setProgress(prev => {
+        if (prev >= 95) return prev;
+        // Logarithmic-like slowdown
+        const remaining = 95 - prev;
+        const inc = Math.max(0.2, remaining * 0.05);
+        return Math.min(95, prev + inc);
+      });
+    }, 100);
+    return () => clearInterval(interval);
+  }, []);
+
+  return (
+    <div className="flex flex-col justify-center ml-2">
+      <div className="text-[#404040] dark:text-[#d1d5db] font-serif italic text-[17px] leading-relaxed mb-1">
+        Compacting our conversation so we can keep chatting...
+      </div>
+      <div className="flex items-center gap-3">
+        <div className="w-48 h-1.5 bg-[#EAE8E1] dark:bg-white/10 rounded-full overflow-hidden">
+          <div
+            className="h-full bg-[#404040] dark:bg-[#d1d5db] rounded-full transition-all duration-100 ease-out"
+            style={{ width: `${progress}%` }}
+          />
+        </div>
+        <span className="text-[13px] text-[#707070] dark:text-[#9ca3af] font-medium font-mono">
+          {Math.round(progress)}%
+        </span>
+      </div>
+    </div>
+  );
+};
 
 // 时间戳格式化
 function formatMessageTime(dateStr: string): string {
   if (!dateStr) return '';
-  
+
   let timeStr = dateStr;
   // Handle SQLite format (space instead of T)
   if (timeStr.includes(' ') && !timeStr.includes('T')) {
@@ -45,6 +101,259 @@ function formatMessageTime(dateStr: string): string {
   return `${date.getFullYear()}年${date.getMonth() + 1}月${date.getDate()}日`;
 }
 
+function stripThinking(model: string) {
+  return (model || '').replace(/-thinking$/, '');
+}
+
+function withThinking(base: string, thinking: boolean) {
+  return thinking ? `${base}-thinking` : base;
+}
+
+function isThinkingModel(model: string) {
+  return typeof model === 'string' && model.endsWith('-thinking');
+}
+
+function isSearchStatusMessage(message: string) {
+  if (!message) return false;
+  return (
+    message.startsWith('正在搜索：') ||
+    message.startsWith('正在读取网页：') ||
+    message.startsWith('正在浏览 GitHub：')
+  );
+}
+
+// Extract display text from content that may be a plain string or a JSON-stringified content array
+function extractTextContent(content: any): string {
+  if (!content) return '';
+  if (typeof content !== 'string') return String(content);
+  // Try to parse as JSON array (Anthropic API content format)
+  if (content.startsWith('[')) {
+    try {
+      const parsed = JSON.parse(content);
+      if (Array.isArray(parsed)) {
+        return parsed
+          .filter((block: any) => block && block.type === 'text' && block.text)
+          .map((block: any) => block.text)
+          .join('\n');
+      }
+    } catch {
+      // Not valid JSON, treat as plain text
+    }
+  }
+  return content;
+}
+
+function withAuthToken(url: string) {
+  if (!url || url.startsWith('data:') || /[?&]token=/.test(url)) return url;
+  if (typeof window === 'undefined') return url;
+  const token = localStorage.getItem('auth_token');
+  if (!token) return url;
+  return `${url}${url.includes('?') ? '&' : '?'}token=${encodeURIComponent(token)}`;
+}
+
+function normalizeMessageDocuments(message: any): DocumentInfo[] {
+  const raw = Array.isArray(message?.documents)
+    ? message.documents
+    : (message?.document ? [message.document] : []);
+  const docs: DocumentInfo[] = [];
+  const seen = new Set<string>();
+
+  for (const doc of raw) {
+    if (!doc || typeof doc !== 'object') continue;
+    const key = doc.id || doc.url || doc.filename || `${doc.title || 'doc'}-${docs.length}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    docs.push(doc as DocumentInfo);
+  }
+
+  // Extract documents from Write tool calls, then apply subsequent Edit operations
+  const previewExts = ['md', 'txt', 'html', 'json', 'xml', 'yaml', 'yml', 'csv'];
+  if (Array.isArray(message?.toolCalls)) {
+    // First pass: collect initial Write content per file path
+    const fileContents = new Map<string, string>();
+    const fileOrder: string[] = [];
+    for (const tc of message.toolCalls) {
+      if (tc.name === 'Write' && tc.input?.file_path && tc.input?.content) {
+        const fp = tc.input.file_path as string;
+        fileContents.set(fp, tc.input.content);
+        if (!fileOrder.includes(fp)) fileOrder.push(fp);
+      }
+    }
+    // Second pass: apply Edit operations to the accumulated content
+    for (const tc of message.toolCalls) {
+      if ((tc.name === 'Edit' || tc.name === 'MultiEdit') && tc.input?.file_path && tc.input?.old_string != null && tc.input?.new_string != null) {
+        const fp = tc.input.file_path as string;
+        const current = fileContents.get(fp);
+        if (current != null) {
+          fileContents.set(fp, current.replaceAll(tc.input.old_string, tc.input.new_string));
+        }
+      }
+    }
+    // Create document entries from final content
+    for (const fp of fileOrder) {
+      const fileName = fp.split(/[/\\]/).pop() || fp;
+      const ext = fileName.split('.').pop()?.toLowerCase() || '';
+      if (!previewExts.includes(ext)) continue;
+      const key = `write-${fp}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      docs.push({
+        id: key,
+        title: fileName,
+        filename: fileName,
+        url: '',
+        content: fileContents.get(fp) || '',
+        format: ext === 'md' ? 'markdown' : 'text',
+      });
+    }
+  }
+
+  return docs;
+}
+
+function parseInlineArtifactDisplay(content: any): { cleanedContent: string; draft: DocumentDraftInfo | null } | null {
+  if (typeof content !== 'string' || !content.includes('<cp_artifact')) return null;
+
+  const openMatch = content.match(/<cp_artifact\s+([^>]*)>/i);
+  if (!openMatch || openMatch.index === undefined) return null;
+
+  const attrsRaw = openMatch[1] || '';
+  const title = (attrsRaw.match(/title="([^"]*)"/i)?.[1] || '').trim() || 'Untitled document';
+  const format = (attrsRaw.match(/format="([^"]*)"/i)?.[1] || 'markdown').trim() || 'markdown';
+  const openTag = openMatch[0];
+  const bodyStart = openMatch.index + openTag.length;
+  const closeTag = '</cp_artifact>';
+  const closeIdx = content.indexOf(closeTag, bodyStart);
+
+  if (closeIdx === -1) {
+    const preview = content.slice(bodyStart).replace(/^\n/, '');
+    const cleanedContent = content.slice(0, openMatch.index).trim().replace(/\n{3,}/g, '\n\n');
+    return {
+      cleanedContent,
+      draft: {
+        draftId: `inline-${title}-${format}`,
+        title,
+        format,
+        preview,
+        previewAvailable: preview.length > 0,
+        done: false,
+      },
+    };
+  }
+
+  const preview = content.slice(bodyStart, closeIdx).replace(/^\n/, '');
+  const before = content.slice(0, openMatch.index);
+  const after = content.slice(closeIdx + closeTag.length);
+  const cleanedContent = `${before}${after}`.trim().replace(/\n{3,}/g, '\n\n');
+
+  return {
+    cleanedContent,
+    draft: {
+      draftId: `inline-${title}-${format}`,
+      title,
+      format,
+      preview,
+      previewAvailable: preview.length > 0,
+      done: true,
+    },
+  };
+}
+
+function sanitizeInlineArtifactMessage(message: any) {
+  if (!message || message.role !== 'assistant') return message;
+  const parsed = parseInlineArtifactDisplay(message.content);
+  if (!parsed) return message;
+
+  let next = { ...message, content: parsed.cleanedContent };
+  if (parsed.draft && normalizeMessageDocuments(next).length === 0) {
+    next = mergeDocumentDraftIntoMessage(next, parsed.draft);
+  }
+  return next;
+}
+
+function mergeDocumentsIntoMessage(message: any, incomingDoc?: DocumentInfo | null, incomingDocs?: DocumentInfo[] | null) {
+  const merged = [...normalizeMessageDocuments(message)];
+  const queue = [
+    ...(Array.isArray(incomingDocs) ? incomingDocs : []),
+    ...(incomingDoc ? [incomingDoc] : []),
+  ];
+
+  for (const doc of queue) {
+    if (!doc || typeof doc !== 'object') continue;
+    const key = doc.id || doc.url || doc.filename || doc.title;
+    if (!key) continue;
+    const index = merged.findIndex(item => (item.id || item.url || item.filename || item.title) === key);
+    if (index >= 0) merged[index] = doc;
+    else merged.push(doc);
+  }
+
+  if (merged.length === 0) return message;
+  return { ...message, document: merged[merged.length - 1], documents: merged };
+}
+
+function applyGenerationState(message: any, state: any) {
+  const base = {
+    ...message,
+    content: state.text || message.content,
+    thinking: state.thinking || message.thinking,
+    thinkingSummary: state.thinkingSummary || message.thinkingSummary,
+    citations: state.citations?.length ? state.citations : message.citations,
+    searchLogs: state.searchLogs?.length ? state.searchLogs : message.searchLogs,
+    isThinking: !state.text && !!state.thinking,
+  };
+  const withDocuments = mergeDocumentsIntoMessage(base, state.document, state.documents);
+  const drafts = Array.isArray(state?.documentDrafts) ? state.documentDrafts : [];
+  const withDrafts = drafts.length === 0
+    ? withDocuments
+    : drafts.reduce((acc, draft) => mergeDocumentDraftIntoMessage(acc, draft), withDocuments);
+  return sanitizeInlineArtifactMessage(withDrafts);
+}
+
+function normalizeDocumentDrafts(message: any): DocumentDraftInfo[] {
+  const raw = Array.isArray(message?.documentDrafts) ? message.documentDrafts : [];
+  const last = raw[raw.length - 1];
+  if (!last || typeof last !== 'object') return [];
+  const key = last.draftId || last.draft_id || last.title || 'draft';
+  return [{
+    draftId: key,
+    title: last.title,
+    format: last.format,
+    preview: last.preview,
+    previewAvailable: last.previewAvailable ?? last.preview_available,
+    done: !!last.done,
+  }];
+}
+
+function mergeDocumentDraftIntoMessage(message: any, incomingDraft: any) {
+  if (!incomingDraft || typeof incomingDraft !== 'object') return message;
+  const draftId = incomingDraft.draftId || incomingDraft.draft_id || incomingDraft.title;
+  if (!draftId) return message;
+
+  const current = normalizeDocumentDrafts(message)[0] || null;
+  const nextDraft: DocumentDraftInfo = {
+    draftId,
+    title: incomingDraft.title,
+    format: incomingDraft.format,
+    preview: incomingDraft.preview ?? incomingDraft.document?.content,
+    previewAvailable: incomingDraft.previewAvailable ?? incomingDraft.preview_available ?? !!incomingDraft.document?.content,
+    done: !!incomingDraft.done,
+  };
+  const merged: DocumentDraftInfo = current
+    ? {
+      ...current,
+      ...nextDraft,
+      draftId: current.draftId || nextDraft.draftId,
+      title: nextDraft.title || current.title,
+      format: nextDraft.format || current.format,
+      preview: nextDraft.preview ?? current.preview,
+      previewAvailable: nextDraft.previewAvailable ?? current.previewAvailable,
+      done: typeof incomingDraft.done === 'boolean' ? incomingDraft.done : current.done,
+    }
+    : nextDraft;
+
+  return { ...message, documentDrafts: [merged] };
+}
+
 interface MainContentProps {
   onNewChat: () => void; // Callback to tell sidebar to refresh
   resetKey?: number;
@@ -58,6 +367,12 @@ interface MainContentProps {
 
 // 草稿存储：在切换对话、打开设置页面时保留输入内容和附件
 const draftsStore = new Map<string, { text: string; files: PendingFile[]; height: number }>();
+
+interface ModelCatalog {
+  common: SelectableModel[];
+  all: SelectableModel[];
+  fallback_model: string | null;
+}
 
 /** Memoized message list — skips re-render when only inputText changes */
 interface MessageListProps {
@@ -94,7 +409,7 @@ const MessageList = React.memo<MessageListProps>(({
           100% { background-position: -200% 0; }
         }
         .animate-shimmer-text {
-          background: linear-gradient(90deg, #6b7280 45%, #ffffff 50%, #6b7280 55%);
+          background: linear-gradient(90deg, var(--text-claude-secondary) 45%, var(--text-claude-main) 50%, var(--text-claude-secondary) 55%);
           background-size: 200% 100%;
           -webkit-background-clip: text;
           -webkit-text-fill-color: transparent;
@@ -111,12 +426,12 @@ const MessageList = React.memo<MessageListProps>(({
               <div className="flex-1 h-px bg-claude-border" />
             </div>
           )}
-          {msg.role === 'user' ? (
+          {msg.is_summary === 1 ? null : msg.role === 'user' ? (
             editingMessageIdx === idx ? (
               <div className="w-full bg-[#F0EEE7] dark:bg-claude-btnHover rounded-xl p-3 border border-black/5 dark:border-white/10">
                 <div className="bg-white dark:bg-black/20 rounded-lg border border-black/10 dark:border-white/10 focus-within:ring-2 focus-within:ring-blue-500/20 focus-within:border-blue-500 transition-all p-3">
                   <textarea
-                    className="w-full bg-transparent text-claude-text outline-none resize-none text-[16px] leading-relaxed font-sans block"
+                    className="w-full bg-transparent text-claude-text outline-none resize-none text-[16px] leading-relaxed font-sans font-[350] block"
                     value={editingContent}
                     onChange={(e) => {
                       onSetEditingContent(e.target.value);
@@ -142,15 +457,15 @@ const MessageList = React.memo<MessageListProps>(({
                     </span>
                   </div>
                   <div className="flex items-center gap-2 shrink-0">
-                    <button 
-                      onClick={onEditCancel} 
+                    <button
+                      onClick={onEditCancel}
                       className="px-3 py-1.5 text-[13px] font-medium text-claude-text bg-white dark:bg-claude-bg border border-black/10 dark:border-white/10 hover:bg-gray-50 dark:hover:bg-claude-hover rounded-lg transition-colors"
                     >
                       Cancel
                     </button>
-                    <button 
-                      onClick={onEditSave} 
-                      disabled={!editingContent.trim() || editingContent === msg.content} 
+                    <button
+                      onClick={onEditSave}
+                      disabled={!editingContent.trim() || editingContent === msg.content}
                       className="px-3 py-1.5 text-[13px] font-medium text-white bg-claude-text hover:bg-claude-textSecondary rounded-lg transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
                     >
                       Save
@@ -165,10 +480,17 @@ const MessageList = React.memo<MessageListProps>(({
                     <MessageAttachments attachments={msg.attachments} onOpenDocument={onOpenDocument} />
                   </div>
                 )}
-                {msg.content && msg.content.trim() !== '' && (
+                {(!msg.attachments || msg.attachments.length === 0) && msg.has_attachments === 1 && (
+                  <div className="max-w-[85%] w-fit mb-1">
+                    <div className="bg-[#F0EEE7] dark:bg-claude-btnHover text-claude-textSecondary px-3.5 py-2 text-[14px] rounded-2xl font-sans italic">
+                      📎 Files attached
+                    </div>
+                  </div>
+                )}
+                {(() => { const displayText = extractTextContent(msg.content); return displayText && displayText.trim() !== ''; })() && (
                   <div className="max-w-[85%] w-fit relative">
                     <div
-                      className="bg-[#F0EEE7] dark:bg-claude-btnHover text-claude-text px-3.5 py-2.5 text-[16px] leading-relaxed font-sans whitespace-pre-wrap break-words relative overflow-hidden"
+                      className="bg-[#F0EEE7] dark:bg-claude-btnHover text-claude-text px-3.5 py-2.5 text-[16px] leading-relaxed font-sans font-[350] whitespace-pre-wrap break-words relative overflow-hidden"
                       style={{
                         maxHeight: expandedMessages.has(idx) ? 'none' : '300px',
                         borderRadius: ((() => {
@@ -179,7 +501,7 @@ const MessageList = React.memo<MessageListProps>(({
                       }}
                       ref={(el) => { if (el) messageContentRefs.current.set(idx, el); }}
                     >
-                      {msg.content}
+                      {extractTextContent(msg.content)}
                       {!expandedMessages.has(idx) && (() => {
                         const el = messageContentRefs.current.get(idx);
                         return el && el.scrollHeight > 300;
@@ -244,13 +566,37 @@ const MessageList = React.memo<MessageListProps>(({
                     </span>
                     <ChevronDown size={14} className={`transform transition-transform duration-200 ${msg.isThinkingExpanded ? 'rotate-180' : ''}`} />
                   </div>
-                  
+
                   {msg.isThinkingExpanded && (
                     <div className="mt-2 ml-1 pl-4 border-l-2 border-claude-border">
-                      <div className="flex gap-3">
-                        <div className="text-claude-textSecondary text-[14px] leading-normal whitespace-pre-wrap">
-                          {msg.thinking}
+                      <div className="flex flex-col">
+                        <div className="relative">
+                          <div
+                            className="text-claude-textSecondary text-[14px] leading-normal whitespace-pre-wrap overflow-hidden"
+                            style={{ maxHeight: expandedMessages.has(idx) ? 'none' : '300px' }}
+                            ref={(el) => { if (el) messageContentRefs.current.set(idx, el); }}
+                          >
+                            {msg.thinking}
+                          </div>
+                          {!expandedMessages.has(idx) && (() => {
+                            const el = messageContentRefs.current.get(idx);
+                            return el && el.scrollHeight > 300;
+                          })() && (
+                              <div className="absolute bottom-0 left-0 right-0 h-16 bg-gradient-to-t from-claude-bg to-transparent pointer-events-none" />
+                            )}
                         </div>
+                        {(() => {
+                          const el = messageContentRefs.current.get(idx);
+                          const isOverflow = el && el.scrollHeight > 300;
+                          if (!isOverflow) return null;
+                          return (
+                            <div className="pt-1">
+                              <button onClick={() => onToggleExpand(idx)} className="text-[13px] text-claude-text hover:text-claude-textSecondary transition-colors font-medium">
+                                {expandedMessages.has(idx) ? 'Show less' : 'Show more'}
+                              </button>
+                            </div>
+                          );
+                        })()}
                       </div>
                       {!msg.isThinking && (
                         <div className="flex items-center gap-2 mt-2 text-claude-textSecondary">
@@ -262,23 +608,155 @@ const MessageList = React.memo<MessageListProps>(({
                   )}
                 </div>
               )}
+              {/* Tool calls display */}
+              {msg.toolCalls && msg.toolCalls.length > 0 && (() => {
+                const isStale = (!loading && idx === messages.length - 1) || (idx < messages.length - 1) || !!msg.content;
+
+                const toolNames = msg.toolCalls.map((tc: any) => {
+                  const nameMap: Record<string, string> = {
+                    'Read': 'Read file', 'Write': 'Write file', 'Edit': 'Edit file',
+                    'Bash': 'Run command', 'ListDir': 'List directory',
+                    'MultiEdit': 'Edit files', 'Search': 'Search',
+                  };
+                  return nameMap[tc.name] || tc.name;
+                });
+                const uniqueNames = [...new Set(toolNames)];
+                const allDone = msg.toolCalls.every((tc: any) => {
+                  const rs = (tc.status === 'running' && isStale) ? 'canceled' : tc.status;
+                  return rs !== 'running';
+                });
+                const hasError = msg.toolCalls.some((tc: any) => tc.status === 'error');
+                const summary = uniqueNames.join(', ');
+
+                return (
+                  <div className="mb-4">
+                    <div
+                      className="flex items-center gap-2 cursor-pointer select-none group/tool text-claude-textSecondary hover:text-claude-text transition-colors"
+                      onClick={() => {
+                        onSetMessages(prev =>
+                          prev.map((m, i) =>
+                            i === idx ? { ...m, isToolCallsExpanded: !m.isToolCallsExpanded } : m
+                          )
+                        );
+                      }}
+                    >
+                      {!allDone && (
+                        <FileText size={16} className="text-claude-textSecondary animate-pulse" />
+                      )}
+                      {allDone && !hasError && (
+                        <Check size={16} className="text-claude-textSecondary" />
+                      )}
+                      {allDone && hasError && (
+                        <span className="text-red-400 text-[14px]">✗</span>
+                      )}
+                      <span className={`text-[14px] ${!allDone ? 'animate-shimmer-text' : 'text-claude-textSecondary'}`}>
+                        {summary}
+                      </span>
+                      <ChevronDown size={14} className={`transform transition-transform duration-200 ${msg.isToolCallsExpanded ? 'rotate-180' : ''}`} />
+                    </div>
+
+                    {msg.isToolCallsExpanded && (
+                      <div className="mt-2 ml-1 pl-4 border-l-2 border-claude-border space-y-3">
+                        {msg.toolCalls.map((tc: any, tcIdx: number) => {
+                          const inputStr = tc.input ? (typeof tc.input === 'string' ? tc.input : JSON.stringify(tc.input, null, 2)) : '';
+                          const inputPreview = tc.input?.file_path || tc.input?.command || tc.input?.path || (inputStr.length > 80 ? inputStr.slice(0, 80) + '...' : inputStr);
+                          const realStatus = (tc.status === 'running' && isStale) ? 'canceled' : tc.status;
+                          const expandable = hasExpandableContent(tc.name, tc.input, tc.result);
+                          const stats = getToolStats(tc.name, tc.input);
+
+                          return (
+                            <div key={tc.id || tcIdx} className="text-[13px] bg-black/5 dark:bg-black/20 rounded-lg overflow-hidden border border-black/5 dark:border-white/5 mx-1 w-full">
+                              <div
+                                className={`flex items-center justify-between px-3 py-2 transition-colors ${expandable ? 'cursor-pointer hover:bg-black/5 dark:hover:bg-white/5' : ''}`}
+                                onClick={() => {
+                                  if (!expandable) return;
+                                  onSetMessages(prev =>
+                                    prev.map((m, i) => {
+                                      if (i !== idx) return m;
+                                      const newTc = [...m.toolCalls];
+                                      newTc[tcIdx] = { ...newTc[tcIdx], isExpanded: newTc[tcIdx].isExpanded === undefined ? false : !newTc[tcIdx].isExpanded };
+                                      return { ...m, toolCalls: newTc };
+                                    })
+                                  );
+                                }}
+                              >
+                                <div className="flex items-center gap-2 overflow-hidden">
+                                  {tc.name === 'Bash' ? (
+                                    <span className="text-claude-textSecondary font-mono font-bold">&gt;_</span>
+                                  ) : (
+                                    <FileText size={14} className="text-claude-textSecondary flex-shrink-0" />
+                                  )}
+                                  <span className="text-claude-text font-mono text-[12px] truncate">
+                                    {inputPreview || tc.name}
+                                  </span>
+                                </div>
+                                <div className="flex items-center gap-2 flex-shrink-0 ml-4">
+                                  {/* +N / -N line stats for Edit/Write */}
+                                  {stats && realStatus !== 'running' && (
+                                    <span className="text-[11px] font-mono flex items-center gap-1.5">
+                                      {stats.added > 0 && <span className="text-green-500 dark:text-green-400">+{stats.added}</span>}
+                                      {stats.removed > 0 && <span className="text-red-500 dark:text-red-400">-{stats.removed}</span>}
+                                    </span>
+                                  )}
+                                  {realStatus === 'running' && <span className="text-claude-textSecondary text-[12px] animate-pulse">Running...</span>}
+                                  {realStatus === 'error' && <span className="text-red-400/80 text-[12px]">Failed</span>}
+                                  {realStatus !== 'running' && expandable && (
+                                    <ChevronDown size={14} className={`text-claude-textSecondary transform transition-transform duration-200 ${(tc.isExpanded ?? false) ? 'rotate-180' : ''}`} />
+                                  )}
+                                </div>
+                              </div>
+                              {expandable && realStatus !== 'running' && (tc.isExpanded ?? false) && (
+                                <div className="px-2 py-2 border-t border-black/5 dark:border-white/5">
+                                  {shouldUseDiffView(tc.name, tc.input) ? (
+                                    <ToolDiffView toolName={tc.name} input={tc.input} result={tc.result} />
+                                  ) : tc.result != null ? (
+                                    <div className="px-1 text-claude-textSecondary text-[12px] font-mono max-h-[400px] overflow-y-auto whitespace-pre-wrap bg-black/5 dark:bg-black/40 rounded-md p-2">
+                                      {typeof tc.result === 'string' ? (tc.result.length > 2000 ? tc.result.slice(0, 2000) + '...' : tc.result || '(Empty output)') : JSON.stringify(tc.result).slice(0, 2000)}
+                                    </div>
+                                  ) : null}
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })}
+                        {allDone && (
+                          <div className="flex items-center gap-2 text-claude-textSecondary pt-1 pb-1">
+                            <Check size={14} />
+                            <span className="text-[13px]">Done</span>
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                );
+              })()}
               {msg.searchStatus && (!msg.searchLogs || msg.searchLogs.length === 0) && (!msg.content || msg.content.length === (msg._contentLenBeforeSearch || 0)) && loading && idx === messages.length - 1 && (
                 <div className="flex items-center justify-center gap-2 text-[15px] font-medium mb-4 w-full">
-                  <Globe size={18} className="text-[#6b7280]" />
+                  <Globe size={18} className="text-claude-textSecondary" />
                   <span className="animate-shimmer-text">
                     Searching the web
                   </span>
                 </div>
               )}
-              
+
               {msg.searchLogs && msg.searchLogs.length > 0 && (
                 <SearchProcess logs={msg.searchLogs} isThinking={msg.isThinking} isDone={(msg.content || '').length > (msg._contentLenBeforeSearch || 0)} />
               )}
 
+              {normalizeDocumentDrafts(msg).length > 0 && (
+                <DocumentCreationProcess drafts={normalizeDocumentDrafts(msg)} />
+              )}
+
               <MarkdownRenderer content={msg.content} citations={msg.citations} />
-              {msg.document && (
-                <div className="mt-2 mb-1">
-                  <DocumentCard document={msg.document} onOpen={(doc) => onOpenDocument?.(doc)} />
+              {normalizeMessageDocuments(msg).length > 0 && (
+                <div className="mt-2 mb-1 space-y-2">
+                  {normalizeMessageDocuments(msg).map((doc, docIdx) => (
+                    <DocumentCard
+                      key={doc.id || `${idx}-${docIdx}`}
+                      document={doc}
+                      onOpen={(openedDoc) => onOpenDocument?.(openedDoc)}
+                    />
+                  ))}
                 </div>
               )}
               {msg.codeExecution && (
@@ -295,12 +773,12 @@ const MessageList = React.memo<MessageListProps>(({
                 <div className="my-3 space-y-2">
                   {(msg as any).codeImages.map((url: string, i: number) => (
                     <div key={i} className="rounded-lg overflow-hidden">
-                      <img src={url} alt={`图表 ${i + 1}`} className="max-w-full" />
+                      <img src={withAuthToken(url)} alt={`图表 ${i + 1}`} className="max-w-full" />
                     </div>
                   ))}
                 </div>
               )}
-              {loading && idx === messages.length - 1 && !msg.content && !msg.thinking && !msg.searchStatus && (
+              {loading && idx === messages.length - 1 && !msg.content && !msg.thinking && !msg.searchStatus && normalizeDocumentDrafts(msg).length === 0 && !(msg.toolCalls && msg.toolCalls.length > 0) && (
                 <span className="inline-block ml-1 align-middle" style={{ verticalAlign: 'middle' }}>
                   <ClaudeLogo breathe style={{ width: '40px', height: '40px', display: 'inline-block' }} />
                 </span>
@@ -311,16 +789,10 @@ const MessageList = React.memo<MessageListProps>(({
                 </span>
               )}
               {!loading && idx === messages.length - 1 && msg.content && (
-                <span className="inline-flex items-center gap-2 ml-0.5 mt-3">
-                  <ClaudeLogo autoAnimate={compactStatus.state === 'compacting'} style={{ width: '40px', height: '40px', display: 'inline-block' }} />
-                  {compactStatus.state === 'compacting' && (
-                    <div className="flex items-center gap-2">
-                      <div className="w-48 h-1 bg-[#E5E5E5] rounded-full overflow-hidden">
-                        <div className="h-full bg-[#D97757] rounded-full animate-[compactProgress_2s_ease-in-out_infinite]" />
-                      </div>
-                    </div>
-                  )}
-                </span>
+                <div className="flex items-start gap-4 mt-6 ml-1 mb-2">
+                  <ClaudeLogo breathe={compactStatus.state === 'compacting'} style={{ width: '36px', height: '36px', flexShrink: 0, marginTop: '2px' }} />
+                  {compactStatus.state === 'compacting' && <CompactingStatus />}
+                </div>
               )}
             </div>
           )}
@@ -335,7 +807,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
   const location = useLocation();
   const [localId, setLocalId] = useState<string | null>(null);
   const [showEntranceAnimation, setShowEntranceAnimation] = useState(false);
-  
+
   // Use localId if we just created a chat, effectively overriding the lack of URL param until next true navigation
   const activeId = id || localId || null;
 
@@ -347,9 +819,15 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
   // Notify parent about artifacts
   useEffect(() => {
     if (onArtifactsUpdate) {
-      const docs = messages
-        .filter((m: any) => m.document)
-        .map((m: any) => m.document as DocumentInfo);
+      const docsMap = new Map<string, DocumentInfo>();
+      for (const message of messages) {
+        for (const doc of normalizeMessageDocuments(message)) {
+          const key = doc.id || doc.url || doc.filename || doc.title;
+          if (!key) continue;
+          docsMap.set(key, doc);
+        }
+      }
+      const docs = Array.from(docsMap.values());
       onArtifactsUpdate(docs);
     }
   }, [messages, onArtifactsUpdate]);
@@ -361,10 +839,26 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
   }, [activeId, messages.length, onChatModeChange]);
 
 
-
-  // Model state defaults from user settings
-  const getDefaultModel = () => localStorage.getItem('default_model') || 'claude-opus-4-6-thinking';
-  const [currentModelString, setCurrentModelString] = useState(getDefaultModel);
+  // Model state
+  const [modelCatalog, setModelCatalog] = useState<ModelCatalog | null>(null);
+  const fallbackCommonModels = useMemo<SelectableModel[]>(() => ([
+    { id: 'claude-opus-4-6', name: 'Opus 4.6', enabled: 1 },
+    { id: 'claude-sonnet-4-6', name: 'Sonnet 4.6', enabled: 1 },
+    { id: 'claude-haiku-4-5-20251001', name: 'Haiku 4.5', enabled: 1 },
+  ]), []);
+  const displayCommonModels = modelCatalog?.common?.length ? modelCatalog.common : fallbackCommonModels;
+  const selectorModels = useMemo<SelectableModel[]>(() => {
+    const visible = [...displayCommonModels];
+    const seen = new Set(visible.map(m => m.id));
+    const gptModels = (modelCatalog?.all || []).filter(m => /^gpt-/i.test(m.id));
+    for (const model of gptModels) {
+      if (seen.has(model.id)) continue;
+      visible.push(model);
+      seen.add(model.id);
+    }
+    return visible;
+  }, [displayCommonModels, modelCatalog]);
+  const [currentModelString, setCurrentModelString] = useState(localStorage.getItem('default_model') || 'claude-sonnet-4-5-20250929-thinking');
   const [conversationTitle, setConversationTitle] = useState("");
 
   useEffect(() => {
@@ -376,7 +870,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
   // Welcome greeting — randomized per new chat, time-aware
   const welcomeGreeting = useMemo(() => {
     const hour = new Date().getHours();
-    const name = user?.nickname || 'there';
+    const name = user?.display_name || user?.nickname || 'there';
     const timeGreetings = hour < 6
       ? [`Night owl mode, ${name}`, `Burning the midnight oil, ${name}?`, `Still up, ${name}?`]
       : hour < 12
@@ -402,6 +896,33 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
   const activeRequestCountRef = useRef(0);
   const pollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const lastResetKeyRef = useRef(0);
+  const streamConversationIdRef = useRef<string | null>(null);
+  const streamRequestIdRef = useRef(0);
+
+  const isModelSelectable = useCallback((modelString: string) => {
+    const base = stripThinking(modelString);
+    const pool = modelCatalog?.all || displayCommonModels;
+    const found = pool.find(m => m.id === base);
+    return !!found && Number(found.enabled) === 1;
+  }, [modelCatalog, displayCommonModels]);
+
+  const resolveModelForNewChat = useCallback((preferredModel?: string | null) => {
+    const saved = preferredModel || localStorage.getItem('default_model') || 'claude-sonnet-4-5-20250929-thinking';
+    const thinking = isThinkingModel(saved);
+    const base = stripThinking(saved);
+    const all = modelCatalog?.all || displayCommonModels;
+    const preferred = all.find(m => m.id === base);
+    if (preferred && Number(preferred.enabled) === 1) {
+      return withThinking(base, thinking);
+    }
+
+    const fallbackBase = modelCatalog?.fallback_model
+      || all.find(m => /sonnet/i.test(m.id) && Number(m.enabled) === 1)?.id
+      || all.find(m => Number(m.enabled) === 1)?.id
+      || base
+      || 'claude-sonnet-4-5-20250929';
+    return withThinking(fallbackBase, thinking);
+  }, [displayCommonModels, modelCatalog]);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
@@ -414,6 +935,8 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
   const [editingMessageIdx, setEditingMessageIdx] = useState<number | null>(null);
   const [editingContent, setEditingContent] = useState('');
   const messageContentRefs = useRef<Map<number, HTMLDivElement>>(new Map());
+  const [inputHeight, setInputHeight] = useState(160);
+  const inputWrapperRef = useRef<HTMLDivElement>(null);
   const [pendingFiles, setPendingFiles] = useState<PendingFile[]>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [isDragging, setIsDragging] = useState(false);
@@ -422,6 +945,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
   const plusBtnRef = useRef<HTMLButtonElement>(null);
   const [compactStatus, setCompactStatus] = useState<{ state: 'idle' | 'compacting' | 'done' | 'error'; message?: string }>({ state: 'idle' });
   const [hasSubscription, setHasSubscription] = useState<boolean | null>(null); // null = loading
+  const [contextInfo, setContextInfo] = useState<{ tokens: number; limit: number } | null>(null);
 
   // 草稿持久化 refs（跟踪最新值，供 effect cleanup 读取）
   const inputTextRef = useRef(inputText);
@@ -461,6 +985,25 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
     return () => observer.disconnect();
   }, [messages]);
 
+  // 动态调整 paddingBottom，使聊天列表能滚到输入框上方
+  useEffect(() => {
+    const el = inputWrapperRef.current;
+    if (!el) return;
+
+    const updateHeight = () => {
+      // 底部留白 = 输入框高度 + 底部边距(48px)
+      setInputHeight(el.offsetHeight + 48);
+    };
+
+    // 初始测量
+    updateHeight();
+
+    const observer = new ResizeObserver(updateHeight);
+    observer.observe(el);
+
+    return () => observer.disconnect();
+  }, [activeId, messages.length]);
+
   // 用户滚轮向上时，立刻中止自动滚动
   useEffect(() => {
     const el = scrollContainerRef.current;
@@ -496,14 +1039,50 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
       lastResetKeyRef.current = resetKey;
       setLocalId(null);
       setMessages([]);
-      setCurrentModelString(getDefaultModel());
+      setCurrentModelString(resolveModelForNewChat());
       setConversationTitle("");
+      setContextInfo(null);
       // 触发入场动画
       setShowEntranceAnimation(true);
       setTimeout(() => setShowEntranceAnimation(false), 800);
       isAtBottomRef.current = true;
     }
-  }, [resetKey]);
+  }, [resetKey, resolveModelForNewChat]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const loadModels = async () => {
+      try {
+        const data = await getUserModels();
+        if (cancelled) return;
+        setModelCatalog(data);
+        if (!activeId) {
+          setCurrentModelString(prev => {
+            const current = prev || localStorage.getItem('default_model') || 'claude-sonnet-4-5-20250929-thinking';
+            const thinking = isThinkingModel(current);
+            const base = stripThinking(current);
+            const all: SelectableModel[] = data?.all?.length ? data.all : fallbackCommonModels;
+            const preferred = all.find((m: SelectableModel) => m.id === base && Number(m.enabled) === 1);
+            if (preferred) return withThinking(base, thinking);
+            const fallbackBase = data?.fallback_model
+              || all.find((m: SelectableModel) => /sonnet/i.test(m.id) && Number(m.enabled) === 1)?.id
+              || all.find((m: SelectableModel) => Number(m.enabled) === 1)?.id
+              || base
+              || 'claude-sonnet-4-5-20250929';
+            return withThinking(fallbackBase, thinking);
+          });
+        }
+      } catch {
+        // ignore
+      }
+    };
+    loadModels();
+    const timer = setInterval(loadModels, 60000);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [activeId, fallbackCommonModels]);
 
   // 草稿持久化：切换对话 / 打开设置页面时保存，切回时恢复
   const draftKey = activeId || '__new__';
@@ -552,16 +1131,23 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
       const hasQuota = usage.token_quota > 0 && usage.token_remaining > 0;
       setHasSubscription(hasSub || hasQuota);
     }).catch(() => setHasSubscription(false));
-    // If we are currently creating/sending (optimistic), don't fetch/clear state yet
+  }, [activeId]);
+
+  useEffect(() => {
+    // 只在会话 ID 真正变化时重新加载对话，避免模型列表/默认模型变化时把流式中的 messages 覆盖掉
     if (activeId && !isCreatingRef.current) {
       loadConversation(activeId);
-    } else if (!activeId) {
-      setMessages([]);
-      // Default model for new chat
-      setCurrentModelString(getDefaultModel());
+      getContextSize(activeId).then(setContextInfo).catch(() => { });
+      isAtBottomRef.current = true;
+      return;
     }
-    // New conversation -> force scroll to bottom
-    if (activeId) isAtBottomRef.current = true;
+
+    if (!activeId) {
+      setMessages([]);
+      setContextInfo(null);
+      // Default model for new chat
+      setCurrentModelString(resolveModelForNewChat());
+    }
   }, [activeId]);
 
   const stopPolling = useCallback(() => {
@@ -571,16 +1157,79 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
     }
   }, []);
 
+  const beginStreamSession = useCallback((conversationId: string) => {
+    const nextId = streamRequestIdRef.current + 1;
+    streamRequestIdRef.current = nextId;
+    streamConversationIdRef.current = conversationId;
+    return nextId;
+  }, []);
+
+  const isStreamSessionActive = useCallback((conversationId: string, requestId: number) => {
+    return streamConversationIdRef.current === conversationId && streamRequestIdRef.current === requestId;
+  }, []);
+
+  const clearStreamSession = useCallback((conversationId: string, requestId: number) => {
+    if (!isStreamSessionActive(conversationId, requestId)) return false;
+    streamConversationIdRef.current = null;
+    return true;
+  }, [isStreamSessionActive]);
+
+  const abortStreamSession = useCallback((targetConversationId?: string) => {
+    const trackedConversationId = streamConversationIdRef.current;
+    if (!trackedConversationId) return false;
+    if (targetConversationId && trackedConversationId !== targetConversationId) return false;
+
+    streamRequestIdRef.current += 1;
+    streamConversationIdRef.current = null;
+
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+      abortControllerRef.current = null;
+      activeRequestCountRef.current = Math.max(0, activeRequestCountRef.current - 1);
+    } else if (pollingRef.current) {
+      stopPolling();
+      stopGeneration(trackedConversationId).catch(e => console.error('[Stop] error:', e));
+    }
+
+    setLoading(false);
+    isCreatingRef.current = false;
+    return true;
+  }, [stopPolling]);
+
   // 组件卸载或对话切换时停止轮询
   useEffect(() => {
     return () => { stopPolling(); };
   }, [activeId, stopPolling]);
 
+  // 对话删除前先中止流式请求，避免旧会话的输出串到当前界面
   useEffect(() => {
-    if (isAtBottomRef.current) {
-      scrollToBottom();
+    const handleConversationDeleting = (evt: Event) => {
+      const customEvt = evt as CustomEvent<{ id?: string }>;
+      const conversationId = customEvt.detail?.id;
+      if (!conversationId) return;
+      abortStreamSession(conversationId);
+    };
+
+    window.addEventListener('conversationDeleting', handleConversationDeleting as EventListener);
+    return () => {
+      window.removeEventListener('conversationDeleting', handleConversationDeleting as EventListener);
+    };
+  }, [abortStreamSession]);
+
+  useEffect(() => {
+    // 只在加载中（模型正在生成）或用户刚发送消息时才自动滚动
+    // 对话结束后不要自动滚动，避免用户正在查看历史消息时被打断
+    if (isAtBottomRef.current && loading && !userScrolledUpRef.current) {
+      scrollToBottom('auto');
     }
-  }, [messages]);
+  }, [messages, loading]);
+
+  // 当输入框高度变化时，如果已经在底部，则保持在底部
+  useEffect(() => {
+    if (isAtBottomRef.current && scrollContainerRef.current) {
+      scrollContainerRef.current.scrollTop = scrollContainerRef.current.scrollHeight;
+    }
+  }, [inputHeight]);
 
   const handleScroll = () => {
     if (scrollContainerRef.current) {
@@ -596,18 +1245,64 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
     }
   };
 
-  const scrollToBottom = () => {
+  const scrollToBottom = (behavior: ScrollBehavior = 'auto') => {
     const el = scrollContainerRef.current;
     if (el) {
-      el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' });
+      el.scrollTo({ top: el.scrollHeight, behavior });
     }
   };
+
+  const scheduleScrollToBottomAfterRender = useCallback((attempts = 6) => {
+    const run = (remaining: number) => {
+      // Respect user scroll: if user scrolled up, abort all scheduled scrolls
+      if (userScrolledUpRef.current || !isAtBottomRef.current) return;
+      const el = scrollContainerRef.current;
+      if (el) {
+        el.scrollTop = el.scrollHeight;
+      }
+      if (remaining > 0) {
+        requestAnimationFrame(() => run(remaining - 1));
+      }
+    };
+
+    requestAnimationFrame(() => run(attempts));
+
+    // 某些内容（Markdown、文档卡片、字体回流）会在首帧后继续撑高高度，
+    // 仅靠 rAF 可能还会停在上方，因此再补几次延迟滚动。
+    // 但必须在每次执行前检查用户是否已经主动滚动了！
+    [80, 200, 400, 800, 1200].forEach((delay) => {
+      window.setTimeout(() => {
+        // Skip if user has scrolled away
+        if (userScrolledUpRef.current || !isAtBottomRef.current) return;
+        const el = scrollContainerRef.current;
+        if (el) {
+          el.scrollTop = el.scrollHeight;
+        }
+      }, delay);
+    });
+  }, []);
 
   const loadConversation = async (conversationId: string) => {
     stopPolling();
     try {
       const data = await getConversation(conversationId);
-      setMessages(data.messages || []);
+      const normalizedMessages = (data.messages || []).map((msg: any) => {
+        // Normalize attachment field names (bridge-server uses camelCase, component expects snake_case)
+        if (msg.attachments && Array.isArray(msg.attachments)) {
+          msg.attachments = msg.attachments.map((att: any) => ({
+            id: att.id || att.fileId || att.file_id || '',
+            file_name: att.file_name || att.fileName || 'file',
+            file_type: att.file_type || att.fileType || 'document',
+            mime_type: att.mime_type || att.mimeType || '',
+            file_size: att.file_size || att.size || 0,
+            ...att,
+          }));
+        }
+        return sanitizeInlineArtifactMessage(msg);
+      });
+      setMessages(normalizedMessages);
+      isAtBottomRef.current = true;
+      scheduleScrollToBottomAfterRender();
       if (data.model) {
         setCurrentModelString(data.model);
       }
@@ -620,36 +1315,34 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
           // 追加占位 assistant 消息（如果最后一条不是 assistant）
           setMessages(prev => {
             const last = prev[prev.length - 1];
-            if (last && last.role === 'assistant' && !last.content && !genStatus.text) {
+            if (
+              last &&
+              last.role === 'assistant' &&
+              !last.content &&
+              !genStatus.text &&
+              !genStatus.thinking &&
+              !(genStatus.documents && genStatus.documents.length > 0) &&
+              !genStatus.document
+            ) {
               // 已有空占位，更新它
               return prev;
             }
             if (last && last.role === 'assistant') {
               // 更新现有 assistant 消息
               const newMsgs = [...prev];
-              newMsgs[newMsgs.length - 1] = {
-                ...last,
-                content: genStatus.text || last.content,
-                thinking: genStatus.thinking || last.thinking,
-                thinkingSummary: genStatus.thinkingSummary || last.thinkingSummary,
-                citations: genStatus.citations?.length ? genStatus.citations : last.citations,
-                searchLogs: genStatus.searchLogs?.length ? genStatus.searchLogs : last.searchLogs,
-                document: genStatus.document || last.document,
-                isThinking: !genStatus.text && !!genStatus.thinking,
-              };
+              newMsgs[newMsgs.length - 1] = applyGenerationState(last, genStatus);
               return newMsgs;
             }
             // 追加新的 assistant 占位
-            return [...prev, {
+            return [...prev, mergeDocumentsIntoMessage({
               role: 'assistant',
               content: genStatus.text || '',
               thinking: genStatus.thinking || '',
               thinkingSummary: genStatus.thinkingSummary,
               citations: genStatus.citations,
               searchLogs: genStatus.searchLogs,
-              document: genStatus.document,
               isThinking: !genStatus.text && !!genStatus.thinking,
-            }];
+            }, genStatus.document, genStatus.documents)];
           });
           setLoading(true);
           isAtBottomRef.current = true;
@@ -663,14 +1356,33 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
                 stopPolling();
                 setLoading(false);
                 const final_ = await getConversation(conversationId);
-                setMessages(final_.messages || []);
+                setMessages((final_.messages || []).map((msg: any) => sanitizeInlineArtifactMessage(msg)));
+                isAtBottomRef.current = true;
+                scheduleScrollToBottomAfterRender();
                 if (final_.title) setConversationTitle(final_.title);
+                getContextSize(conversationId).then(setContextInfo).catch(() => { });
                 return;
               }
               // 跨进程轮询：内容在另一个进程，从数据库拉最新消息
               if (s.crossProcess) {
                 const fresh = await getConversation(conversationId);
-                setMessages(fresh.messages || []);
+                const freshMsgs = (fresh.messages || []).map((msg: any) => sanitizeInlineArtifactMessage(msg));
+                isAtBottomRef.current = true;
+                scheduleScrollToBottomAfterRender();
+                // 如果数据库里最后一条是 assistant，说明有新内容，更新
+                // 否则保留当前显示的内容（助手消息可能还没存到数据库）
+                setMessages(prev => {
+                  const lastFresh = freshMsgs[freshMsgs.length - 1];
+                  const lastPrev = prev[prev.length - 1];
+                  if (lastFresh && lastFresh.role === 'assistant') {
+                    return freshMsgs;
+                  }
+                  // 数据库里还没有助手消息，保留当前显示的占位消息
+                  if (lastPrev && lastPrev.role === 'assistant') {
+                    return prev;
+                  }
+                  return freshMsgs;
+                });
                 return;
               }
               // 更新进度
@@ -678,16 +1390,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
                 const newMsgs = [...prev];
                 const last = newMsgs[newMsgs.length - 1];
                 if (last && last.role === 'assistant') {
-                  newMsgs[newMsgs.length - 1] = {
-                    ...last,
-                    content: s.text || last.content,
-                    thinking: s.thinking || last.thinking,
-                    thinkingSummary: s.thinkingSummary || last.thinkingSummary,
-                    citations: s.citations?.length ? s.citations : last.citations,
-                    searchLogs: s.searchLogs?.length ? s.searchLogs : last.searchLogs,
-                    document: s.document || last.document,
-                    isThinking: !s.text && !!s.thinking,
-                  };
+                  newMsgs[newMsgs.length - 1] = applyGenerationState(last, s);
                 }
                 return newMsgs;
               });
@@ -711,12 +1414,16 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
   };
 
   const handleModelChange = async (newModelString: string) => {
+    if (!isModelSelectable(newModelString)) return;
     setCurrentModelString(newModelString);
 
     // If in an existing conversation, we should update the conversation's model immediately
     if (activeId && !isCreatingRef.current) {
       try {
-        await updateConversation(activeId, { model: newModelString });
+        const updated = await updateConversation(activeId, { model: newModelString });
+        if (updated?.model) {
+          setCurrentModelString(updated.model);
+        }
       } catch (err) {
         console.error("Failed to update conversation model", err);
       }
@@ -725,13 +1432,22 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
 
   const handleSend = async () => {
     const hasFiles = pendingFiles.some(f => f.status === 'done');
-    if ((!inputText.trim() && !hasFiles) || loading) return;
+    const hasErrorFiles = pendingFiles.some(f => f.status === 'error');
+    if ((!inputText.trim() && !hasFiles) || loading) {
+      if (!loading && !inputText.trim() && !hasFiles && hasErrorFiles) {
+        alert('有文件上传失败，请先删除失败文件后再发送');
+      }
+      return;
+    }
     if (activeRequestCountRef.current >= 2) {
       alert('最多同时进行 2 个对话，请等待其他对话完成');
       return;
     }
     const isUploading = pendingFiles.some(f => f.status === 'uploading');
-    if (isUploading) return;
+    if (isUploading) {
+      alert('文件仍在上传中，请稍等完成后再发送');
+      return;
+    }
 
     const userMessageText = inputText;
     setInputText(""); // Clear input
@@ -739,7 +1455,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
     // 收集已上传的附件
     const uploadedFiles = pendingFiles.filter(f => f.status === 'done' && f.fileId);
     const attachmentsPayload = uploadedFiles.length > 0
-      ? uploadedFiles.map(f => ({ fileId: f.fileId! }))
+      ? uploadedFiles.map(f => ({ fileId: f.fileId!, fileName: f.fileName }))
       : null;
 
     // 构建乐观 UI 的附件数据
@@ -774,7 +1490,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
 
     // Force scroll to bottom and track state
     isAtBottomRef.current = true;
-    setTimeout(scrollToBottom, 50);
+    setTimeout(() => scrollToBottom('auto'), 50);
 
     // Prepare assistant message placeholder
     const assistantMsgIndex = messages.length + 1;
@@ -786,9 +1502,15 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
     if (!conversationId) {
       isCreatingRef.current = true; // Block useEffect fetch
       try {
+        const modelForCreate = isModelSelectable(currentModelString)
+          ? currentModelString
+          : resolveModelForNewChat(currentModelString);
+        if (modelForCreate !== currentModelString) {
+          setCurrentModelString(modelForCreate);
+        }
         // 不传临时标题，让后端生成
-        console.log("Creating conversation with model:", currentModelString);
-        const newConv = await createConversation(undefined, currentModelString);
+        console.log("Creating conversation with model:", modelForCreate);
+        const newConv = await createConversation(undefined, modelForCreate);
         console.log("Created conversation response:", newConv);
 
         if (!newConv || !newConv.id) {
@@ -798,9 +1520,12 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
         conversationId = newConv.id;
         console.log("New Conversation ID:", conversationId);
 
-        // Use pushState to update URL without unmounting component
-        window.history.pushState({}, '', `/chat/${conversationId}`);
-        setLocalId(conversationId);
+        // Use React Router navigate so useParams stays in sync with the URL
+        // isCreatingRef prevents the activeId effect from reloading during streaming
+        navigate(`/chat/${conversationId}`, { replace: true });
+        if (newConv.model) {
+          setCurrentModelString(newConv.model);
+        }
         setConversationTitle(newConv.title || 'New Chat');
 
         onNewChat(); // Refresh sidebar
@@ -821,6 +1546,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
 
     // Call streaming API
     const controller = new AbortController();
+    const streamRequestId = beginStreamSession(conversationId!);
     abortControllerRef.current = controller;
     setLoading(true);
     activeRequestCountRef.current += 1;
@@ -829,10 +1555,11 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
       userMessageText,
       attachmentsPayload,
       (delta, full) => {
+        if (!isStreamSessionActive(conversationId!, streamRequestId)) return;
         setMessages(prev => {
           const newMsgs = [...prev];
           const lastMsg = newMsgs[newMsgs.length - 1];
-          if (lastMsg.role === 'assistant') {
+          if (lastMsg && lastMsg.role === 'assistant') {
             lastMsg.content = full;
             lastMsg.isThinking = false; // Switch to text mode
           }
@@ -840,13 +1567,16 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
         });
       },
       (full) => {
+        if (!isStreamSessionActive(conversationId!, streamRequestId)) return;
         setLoading(false);
         activeRequestCountRef.current = Math.max(0, activeRequestCountRef.current - 1);
+        abortControllerRef.current = null;
         isCreatingRef.current = false; // Reset flag
+        clearStreamSession(conversationId!, streamRequestId);
         setMessages(prev => {
           const newMsgs = [...prev];
           const lastMsg = newMsgs[newMsgs.length - 1];
-          if (lastMsg.role === 'assistant') {
+          if (lastMsg && lastMsg.role === 'assistant') {
             lastMsg.content = full;
             lastMsg.isThinking = false;
           }
@@ -879,31 +1609,37 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
         }
       },
       (err) => {
+        if (!isStreamSessionActive(conversationId!, streamRequestId)) return;
         setLoading(false);
         activeRequestCountRef.current = Math.max(0, activeRequestCountRef.current - 1);
+        abortControllerRef.current = null;
         isCreatingRef.current = false;
+        clearStreamSession(conversationId!, streamRequestId);
         setMessages(prev => {
           const newMsgs = [...prev];
-          if (newMsgs[newMsgs.length - 1].role === 'assistant') {
-            newMsgs[newMsgs.length - 1].content = "Error: " + err;
+          if (newMsgs[newMsgs.length - 1] && newMsgs[newMsgs.length - 1].role === 'assistant') {
+            newMsgs[newMsgs.length - 1].content = formatChatError(err);
             newMsgs[newMsgs.length - 1].isThinking = false;
           }
           return newMsgs;
         });
       },
       (thinkingDelta, thinkingFull) => {
+        if (!isStreamSessionActive(conversationId!, streamRequestId)) return;
         // Handle thinking updates
         setMessages(prev => {
           const newMsgs = [...prev];
           const lastMsg = newMsgs[newMsgs.length - 1];
-          if (lastMsg.role === 'assistant') {
+          if (lastMsg && lastMsg.role === 'assistant') {
             lastMsg.thinking = thinkingFull;
             lastMsg.isThinking = true;
+            delete lastMsg.searchStatus;
           }
           return newMsgs;
         });
       },
       (event, message, data) => {
+        if (!isStreamSessionActive(conversationId!, streamRequestId)) return;
         // Handle metadata (update user message ID)
         if (event === 'metadata' && data && data.user_message_id) {
           setMessages(prev => {
@@ -917,12 +1653,11 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
         }
         // Handle system/status events (e.g. web search status)
         if (event === 'status' && message) {
-          // 非搜索类状态不设置为 searchStatus
-          if (message.includes('执行代码') || message.includes('检查文件') || message.includes('正在创建')) return;
+          if (!isSearchStatusMessage(message)) return;
           setMessages(prev => {
             const newMsgs = [...prev];
             const lastMsg = newMsgs[newMsgs.length - 1];
-            if (lastMsg.role === 'assistant') {
+            if (lastMsg && lastMsg.role === 'assistant') {
               lastMsg.searchStatus = message;
               lastMsg._contentLenBeforeSearch = (lastMsg.content || '').length;
             }
@@ -934,40 +1669,59 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
           setMessages(prev => {
             const newMsgs = [...prev];
             const lastMsg = newMsgs[newMsgs.length - 1];
-            if (lastMsg.role === 'assistant') {
+            if (lastMsg && lastMsg.role === 'assistant') {
               lastMsg.thinking_summary = message;
             }
             return newMsgs;
           });
         }
+        // Handle auto compaction progress
+        if (event === 'compaction_start') {
+          setCompactStatus({ state: 'compacting' });
+        }
+        if (event === 'compaction_done') {
+          if (data && data.messagesCompacted > 0) {
+            setCompactStatus({ state: 'done', message: `Compacted ${data.messagesCompacted} messages, saved ~${data.tokensSaved} tokens` });
+            setTimeout(() => setCompactStatus({ state: 'idle' }), 4000);
+          } else {
+            setCompactStatus({ state: 'idle' });
+          }
+        }
+        if (event === 'context_size' && data) {
+          setContextInfo({ tokens: data.tokens, limit: data.limit });
+        }
       },
-      (sources, query) => {
+      (sources, query, tokens) => {
+        if (!isStreamSessionActive(conversationId!, streamRequestId)) return;
         // Handle search_sources — collect citation sources
         setMessages(prev => {
           const newMsgs = [...prev];
           const lastMsg = newMsgs[newMsgs.length - 1];
-          if (lastMsg.role === 'assistant') {
+          if (lastMsg && lastMsg.role === 'assistant') {
             const existing = lastMsg.citations || [];
-            
+
             // 去重合并
             const existingUrls = new Set(existing.map((s: any) => s.url));
             const newSources = sources.filter((s: any) => !existingUrls.has(s.url));
             lastMsg.citations = [...existing, ...newSources];
-            
+
             if (query) {
               const logs = lastMsg.searchLogs || [];
               // 检查是否已存在相同的 query
               const existingLogIndex = logs.findIndex((log: any) => log.query === query);
               if (existingLogIndex !== -1) {
-                // 更新现有 log 的 results
+                // 更新现有 log 的 results 和 tokens
                 const existingLog = logs[existingLogIndex];
                 const currentResults = existingLog.results || [];
                 const currentUrls = new Set(currentResults.map((r: any) => r.url));
                 const uniqueNewResults = sources.filter((s: any) => !currentUrls.has(s.url));
                 existingLog.results = [...currentResults, ...uniqueNewResults];
+                if (tokens !== undefined) {
+                  existingLog.tokens = tokens;
+                }
               } else {
                 // 添加新 log
-                logs.push({ query, results: sources });
+                logs.push({ query, results: sources, tokens });
               }
               lastMsg.searchLogs = logs;
             }
@@ -976,24 +1730,37 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
         });
       },
       (doc) => {
+        if (!isStreamSessionActive(conversationId!, streamRequestId)) return;
         // Handle document_created — store document on the assistant message
         setMessages(prev => {
           const newMsgs = [...prev];
           const lastIdx = newMsgs.length - 1;
-          if (newMsgs[lastIdx].role === 'assistant') {
-            newMsgs[lastIdx] = { ...newMsgs[lastIdx], document: doc };
+          if (newMsgs[lastIdx] && newMsgs[lastIdx].role === 'assistant') {
+            newMsgs[lastIdx] = mergeDocumentsIntoMessage(newMsgs[lastIdx], doc);
+          }
+          return newMsgs;
+        });
+      },
+      (draft) => {
+        if (!isStreamSessionActive(conversationId!, streamRequestId)) return;
+        setMessages(prev => {
+          const newMsgs = [...prev];
+          const lastIdx = newMsgs.length - 1;
+          if (newMsgs[lastIdx] && newMsgs[lastIdx].role === 'assistant') {
+            newMsgs[lastIdx] = mergeDocumentDraftIntoMessage(newMsgs[lastIdx], draft);
           }
           return newMsgs;
         });
       },
       async (data) => {
+        if (!isStreamSessionActive(conversationId!, streamRequestId)) return;
         // Handle code_execution / code_result events
         if (data.type === 'code_execution') {
           // 收到代码执行请求 — 更新消息状态 + 在 Pyodide 中执行
           setMessages(prev => {
             const newMsgs = [...prev];
             const lastMsg = newMsgs[newMsgs.length - 1];
-            if (lastMsg.role === 'assistant') {
+            if (lastMsg && lastMsg.role === 'assistant') {
               lastMsg.codeExecution = {
                 code: data.code || '',
                 status: 'running' as const,
@@ -1007,9 +1774,14 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
           });
 
           // 构建文件列表（附件 URL）
+          const authToken = localStorage.getItem('auth_token') || '';
           const files = (data.files || []).map((f: any) => ({
             name: f.name,
-            url: getAttachmentUrl(f.id),
+            url: (() => {
+              const baseUrl = getAttachmentUrl(f.id);
+              if (!authToken) return baseUrl;
+              return `${baseUrl}${baseUrl.includes('?') ? '&' : '?'}token=${encodeURIComponent(authToken)}`;
+            })(),
           }));
 
           try {
@@ -1032,7 +1804,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
           setMessages(prev => {
             const newMsgs = [...prev];
             const lastMsg = newMsgs[newMsgs.length - 1];
-            if (lastMsg.role === 'assistant' && lastMsg.codeExecution) {
+            if (lastMsg && lastMsg.role === 'assistant' && lastMsg.codeExecution) {
               lastMsg.codeExecution = {
                 ...lastMsg.codeExecution,
                 status: data.error ? 'error' as const : 'done' as const,
@@ -1045,6 +1817,35 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
             return newMsgs;
           });
         }
+      },
+      // Handle tool use events from SDK
+      (toolEvent) => {
+        if (!isStreamSessionActive(conversationId!, streamRequestId)) return;
+        setMessages(prev => {
+          const newMsgs = [...prev];
+          const lastMsg = newMsgs[newMsgs.length - 1];
+          if (!lastMsg || lastMsg.role !== 'assistant') return prev;
+
+          const toolCalls = lastMsg.toolCalls || [];
+
+          if (toolEvent.type === 'start') {
+            toolCalls.push({
+              id: toolEvent.tool_use_id,
+              name: toolEvent.tool_name || 'unknown',
+              input: toolEvent.tool_input,
+              status: 'running' as const,
+            });
+          } else if (toolEvent.type === 'done') {
+            const tc = toolCalls.find((t: any) => t.id === toolEvent.tool_use_id);
+            if (tc) {
+              tc.status = toolEvent.is_error ? 'error' as const : 'done' as const;
+              tc.result = toolEvent.content;
+            }
+          }
+
+          lastMsg.toolCalls = toolCalls;
+          return newMsgs;
+        });
       },
       controller.signal
     );
@@ -1076,12 +1877,10 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
 
   // 停止生成（双模式：SSE 直连 or 轮询模式）
   const handleStop = () => {
-    if (abortControllerRef.current) {
-      // SSE 直连模式
-      abortControllerRef.current.abort();
-      abortControllerRef.current = null;
-      activeRequestCountRef.current = Math.max(0, activeRequestCountRef.current - 1);
-    } else if (pollingRef.current && activeId) {
+    if (abortStreamSession(activeId || undefined)) {
+      return;
+    }
+    if (pollingRef.current && activeId) {
       // 轮询模式：调用后端停止接口
       stopGeneration(activeId).catch(e => console.error('[Stop] error:', e));
       stopPolling();
@@ -1101,6 +1900,20 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
     });
   };
 
+  const extractMessageAttachments = (msg: any) => {
+    const attachments = Array.isArray(msg?.attachments)
+      ? msg.attachments.filter((att: any) => att && typeof att.id === 'string' && att.id.trim())
+      : [];
+    const attachmentIds = attachments.map((att: any) => att.id);
+    return {
+      attachmentIds,
+      attachmentsPayload: attachmentIds.length > 0
+        ? attachmentIds.map((fileId: string) => ({ fileId }))
+        : null,
+      optimisticAttachments: attachments.map((att: any) => ({ ...att })),
+    };
+  };
+
   // 重新发送消息
   const handleResendMessage = async (content: string, idx: number) => {
     if (loading) return;
@@ -1109,36 +1922,50 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
       return;
     }
     const msg = messages[idx];
+    const { attachmentIds, attachmentsPayload, optimisticAttachments } = extractMessageAttachments(msg);
+    const tempUserMsg: any = { role: 'user', content, created_at: new Date().toISOString() };
+    if (optimisticAttachments.length > 0) {
+      tempUserMsg.has_attachments = 1;
+      tempUserMsg.attachments = optimisticAttachments;
+    }
     // 删除当前消息及其后续消息（前端），然后重新添加用户消息 + assistant 占位
     setMessages(prev => [
       ...prev.slice(0, idx),
-      { role: 'user', content, created_at: new Date().toISOString() },
+      tempUserMsg,
       { role: 'assistant', content: '' },
     ]);
-    // 删除后端消息
-    if (activeId && msg.id) {
+    // 删除后端消息（regenerate）
+    if (activeId) {
       try {
-        await deleteMessagesFrom(activeId, msg.id);
+        if (msg.id) {
+          await deleteMessagesFrom(activeId, msg.id, attachmentIds);
+        } else {
+          const tailCount = messages.length - idx;
+          if (tailCount > 0) await deleteMessagesTail(activeId, tailCount, attachmentIds);
+        }
       } catch (err) {
         console.error('Failed to delete messages from backend:', err);
       }
     }
     // 直接重新发送
     isAtBottomRef.current = true;
-    setTimeout(scrollToBottom, 50);
+    setTimeout(() => scrollToBottom('auto'), 50);
     const controller = new AbortController();
+    const conversationId = activeId!;
+    const streamRequestId = beginStreamSession(conversationId);
     abortControllerRef.current = controller;
     setLoading(true);
     activeRequestCountRef.current += 1;
     await sendMessage(
-      activeId!,
+      conversationId,
       content,
-      null,
+      attachmentsPayload,
       (delta, full) => {
+        if (!isStreamSessionActive(conversationId, streamRequestId)) return;
         setMessages(prev => {
           const newMsgs = [...prev];
           const lastMsg = newMsgs[newMsgs.length - 1];
-          if (lastMsg.role === 'assistant') {
+          if (lastMsg && lastMsg.role === 'assistant') {
             lastMsg.content = full;
             lastMsg.isThinking = false;
           }
@@ -1146,13 +1973,15 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
         });
       },
       (full) => {
+        if (!isStreamSessionActive(conversationId, streamRequestId)) return;
         setLoading(false);
         activeRequestCountRef.current = Math.max(0, activeRequestCountRef.current - 1);
         abortControllerRef.current = null;
+        clearStreamSession(conversationId, streamRequestId);
         setMessages(prev => {
           const newMsgs = [...prev];
           const lastMsg = newMsgs[newMsgs.length - 1];
-          if (lastMsg.role === 'assistant') {
+          if (lastMsg && lastMsg.role === 'assistant') {
             lastMsg.content = full;
             lastMsg.isThinking = false;
           }
@@ -1160,30 +1989,35 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
         });
       },
       (err) => {
+        if (!isStreamSessionActive(conversationId, streamRequestId)) return;
         setLoading(false);
         activeRequestCountRef.current = Math.max(0, activeRequestCountRef.current - 1);
         abortControllerRef.current = null;
+        clearStreamSession(conversationId, streamRequestId);
         setMessages(prev => {
           const newMsgs = [...prev];
-          if (newMsgs[newMsgs.length - 1].role === 'assistant') {
-            newMsgs[newMsgs.length - 1].content = "Error: " + err;
+          if (newMsgs[newMsgs.length - 1] && newMsgs[newMsgs.length - 1].role === 'assistant') {
+            newMsgs[newMsgs.length - 1].content = formatChatError(err);
             newMsgs[newMsgs.length - 1].isThinking = false;
           }
           return newMsgs;
         });
       },
       (thinkingDelta, thinkingFull) => {
+        if (!isStreamSessionActive(conversationId, streamRequestId)) return;
         setMessages(prev => {
           const newMsgs = [...prev];
           const lastMsg = newMsgs[newMsgs.length - 1];
-          if (lastMsg.role === 'assistant') {
+          if (lastMsg && lastMsg.role === 'assistant') {
             lastMsg.thinking = thinkingFull;
             lastMsg.isThinking = true;
+            delete lastMsg.searchStatus;
           }
           return newMsgs;
         });
       },
       (event, message, data) => {
+        if (!isStreamSessionActive(conversationId, streamRequestId)) return;
         if (event === 'metadata' && data && data.user_message_id) {
           setMessages(prev => {
             const newMsgs = [...prev];
@@ -1198,14 +2032,39 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
           setMessages(prev => {
             const newMsgs = [...prev];
             const lastMsg = newMsgs[newMsgs.length - 1];
-            if (lastMsg.role === 'assistant') {
+            if (lastMsg && lastMsg.role === 'assistant') {
               lastMsg.thinking_summary = message;
             }
             return newMsgs;
           });
         }
+        if (event === 'context_size' && data) {
+          setContextInfo({ tokens: data.tokens, limit: data.limit });
+        }
       },
       undefined,
+      (doc) => {
+        if (!isStreamSessionActive(conversationId, streamRequestId)) return;
+        setMessages(prev => {
+          const newMsgs = [...prev];
+          const lastIdx = newMsgs.length - 1;
+          if (newMsgs[lastIdx] && newMsgs[lastIdx].role === 'assistant') {
+            newMsgs[lastIdx] = mergeDocumentsIntoMessage(newMsgs[lastIdx], doc);
+          }
+          return newMsgs;
+        });
+      },
+      (draft) => {
+        if (!isStreamSessionActive(conversationId, streamRequestId)) return;
+        setMessages(prev => {
+          const newMsgs = [...prev];
+          const lastIdx = newMsgs.length - 1;
+          if (newMsgs[lastIdx] && newMsgs[lastIdx].role === 'assistant') {
+            newMsgs[lastIdx] = mergeDocumentDraftIntoMessage(newMsgs[lastIdx], draft);
+          }
+          return newMsgs;
+        });
+      },
       undefined,
       undefined,
       controller.signal
@@ -1235,22 +2094,34 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
     const idx = editingMessageIdx;
     const msg = messages[idx];
     const newContent = editingContent.trim();
+    const { attachmentIds, attachmentsPayload, optimisticAttachments } = extractMessageAttachments(msg);
 
     // 退出编辑模式
     setEditingMessageIdx(null);
     setEditingContent('');
 
+    const tempUserMsg: any = { role: 'user', content: newContent, created_at: new Date().toISOString() };
+    if (optimisticAttachments.length > 0) {
+      tempUserMsg.has_attachments = 1;
+      tempUserMsg.attachments = optimisticAttachments;
+    }
+
     // 删除当前消息及其后续消息（前端），同时加入新的用户消息和 assistant 占位
     setMessages(prev => [
       ...prev.slice(0, idx),
-      { role: 'user', content: newContent, created_at: new Date().toISOString() },
+      tempUserMsg,
       { role: 'assistant', content: '' },
     ]);
 
-    // 删除后端消息
-    if (activeId && msg.id) {
+    // 删除后端消息（regenerate）
+    if (activeId) {
       try {
-        await deleteMessagesFrom(activeId, msg.id);
+        if (msg.id) {
+          await deleteMessagesFrom(activeId, msg.id, attachmentIds);
+        } else {
+          const tailCount = messages.length - idx;
+          if (tailCount > 0) await deleteMessagesTail(activeId, tailCount, attachmentIds);
+        }
       } catch (err) {
         console.error('Failed to delete messages from backend:', err);
       }
@@ -1258,24 +2129,26 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
 
     // 直接发送新内容
     isAtBottomRef.current = true;
-    setTimeout(scrollToBottom, 50);
+    setTimeout(() => scrollToBottom('auto'), 50);
 
     const conversationId = activeId;
     if (!conversationId) return;
 
     const controller = new AbortController();
+    const streamRequestId = beginStreamSession(conversationId);
     abortControllerRef.current = controller;
     setLoading(true);
     activeRequestCountRef.current += 1;
     await sendMessage(
       conversationId,
       newContent,
-      null,
+      attachmentsPayload,
       (delta, full) => {
+        if (!isStreamSessionActive(conversationId, streamRequestId)) return;
         setMessages(prev => {
           const newMsgs = [...prev];
           const lastMsg = newMsgs[newMsgs.length - 1];
-          if (lastMsg.role === 'assistant') {
+          if (lastMsg && lastMsg.role === 'assistant') {
             lastMsg.content = full;
             lastMsg.isThinking = false;
           }
@@ -1283,12 +2156,15 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
         });
       },
       (full) => {
+        if (!isStreamSessionActive(conversationId, streamRequestId)) return;
         setLoading(false);
         activeRequestCountRef.current = Math.max(0, activeRequestCountRef.current - 1);
+        abortControllerRef.current = null;
+        clearStreamSession(conversationId, streamRequestId);
         setMessages(prev => {
           const newMsgs = [...prev];
           const lastMsg = newMsgs[newMsgs.length - 1];
-          if (lastMsg.role === 'assistant') {
+          if (lastMsg && lastMsg.role === 'assistant') {
             lastMsg.content = full;
             lastMsg.isThinking = false;
           }
@@ -1296,29 +2172,35 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
         });
       },
       (err) => {
+        if (!isStreamSessionActive(conversationId, streamRequestId)) return;
         setLoading(false);
         activeRequestCountRef.current = Math.max(0, activeRequestCountRef.current - 1);
+        abortControllerRef.current = null;
+        clearStreamSession(conversationId, streamRequestId);
         setMessages(prev => {
           const newMsgs = [...prev];
-          if (newMsgs[newMsgs.length - 1].role === 'assistant') {
-            newMsgs[newMsgs.length - 1].content = "Error: " + err;
+          if (newMsgs[newMsgs.length - 1] && newMsgs[newMsgs.length - 1].role === 'assistant') {
+            newMsgs[newMsgs.length - 1].content = formatChatError(err);
             newMsgs[newMsgs.length - 1].isThinking = false;
           }
           return newMsgs;
         });
       },
       (thinkingDelta, thinkingFull) => {
+        if (!isStreamSessionActive(conversationId, streamRequestId)) return;
         setMessages(prev => {
           const newMsgs = [...prev];
           const lastMsg = newMsgs[newMsgs.length - 1];
-          if (lastMsg.role === 'assistant') {
+          if (lastMsg && lastMsg.role === 'assistant') {
             lastMsg.thinking = thinkingFull;
             lastMsg.isThinking = true;
+            delete lastMsg.searchStatus;
           }
           return newMsgs;
         });
       },
       (event, message, data) => {
+        if (!isStreamSessionActive(conversationId, streamRequestId)) return;
         if (event === 'metadata' && data && data.user_message_id) {
           setMessages(prev => {
             const newMsgs = [...prev];
@@ -1333,14 +2215,39 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
           setMessages(prev => {
             const newMsgs = [...prev];
             const lastMsg = newMsgs[newMsgs.length - 1];
-            if (lastMsg.role === 'assistant') {
+            if (lastMsg && lastMsg.role === 'assistant') {
               lastMsg.thinking_summary = message;
             }
             return newMsgs;
           });
         }
+        if (event === 'context_size' && data) {
+          setContextInfo({ tokens: data.tokens, limit: data.limit });
+        }
       },
       undefined,
+      (doc) => {
+        if (!isStreamSessionActive(conversationId, streamRequestId)) return;
+        setMessages(prev => {
+          const newMsgs = [...prev];
+          const lastIdx = newMsgs.length - 1;
+          if (newMsgs[lastIdx] && newMsgs[lastIdx].role === 'assistant') {
+            newMsgs[lastIdx] = mergeDocumentsIntoMessage(newMsgs[lastIdx], doc);
+          }
+          return newMsgs;
+        });
+      },
+      (draft) => {
+        if (!isStreamSessionActive(conversationId, streamRequestId)) return;
+        setMessages(prev => {
+          const newMsgs = [...prev];
+          const lastIdx = newMsgs.length - 1;
+          if (newMsgs[lastIdx] && newMsgs[lastIdx].role === 'assistant') {
+            newMsgs[lastIdx] = mergeDocumentDraftIntoMessage(newMsgs[lastIdx], draft);
+          }
+          return newMsgs;
+        });
+      },
       undefined,
       undefined,
       controller.signal
@@ -1394,8 +2301,8 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
         reader.onload = (e) => {
           const text = e.target?.result as string;
           if (text) {
-             const lines = text.split(/\r\n|\r|\n/).length;
-             setPendingFiles(prev => prev.map(f => f.id === id ? { ...f, lineCount: lines } : f));
+            const lines = text.split(/\r\n|\r|\n/).length;
+            setPendingFiles(prev => prev.map(f => f.id === id ? { ...f, lineCount: lines } : f));
           }
         };
         reader.readAsText(file);
@@ -1403,7 +2310,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
 
       uploadFile(file, (percent) => {
         setPendingFiles(prev => prev.map(f => f.id === id ? { ...f, progress: percent } : f));
-      }).then((result) => {
+      }, activeId).then((result) => {
         setPendingFiles(prev => prev.map(f => f.id === id ? {
           ...f,
           fileId: result.fileId,
@@ -1427,7 +2334,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
       if (file?.previewUrl) URL.revokeObjectURL(file.previewUrl);
       // 已上传的文件调后端删除，释放存储空间
       if (file?.fileId) {
-        deleteAttachment(file.fileId).catch(() => {});
+        deleteAttachment(file.fileId).catch(() => { });
       }
       return prev.filter(f => f.id !== id);
     });
@@ -1472,14 +2379,16 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
       }
     }
 
-    // 2. 检查长文本 (超过 1000 字符自动转为附件)
+    // 2. 检查长文本 (超过 10000 字符或 100 行自动转为附件)
     const text = e.clipboardData.getData('text');
-    if (text && text.length > 1000) {
-      e.preventDefault();
-      // 创建一个名为 "Pasted-Text.txt" 的文件
-      const blob = new Blob([text], { type: 'text/plain' });
-      const file = new File([blob], 'Pasted-Text.txt', { type: 'text/plain' });
-      handleFilesSelected([file]);
+    if (text) {
+      const lineCount = text.split('\n').length;
+      if (text.length > 10000 || lineCount > 100) {
+        e.preventDefault();
+        const blob = new Blob([text], { type: 'text/plain' });
+        const file = new File([blob], 'Pasted-Text.txt', { type: 'text/plain' });
+        handleFilesSelected([file]);
+      }
     }
   };
 
@@ -1490,10 +2399,10 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
   if (!activeId && messages.length === 0) {
     return (
       <div className={`flex-1 bg-claude-bg h-screen flex flex-col relative overflow-hidden text-claude-text chat-font-scope ${showEntranceAnimation ? 'animate-slide-in' : ''}`}>
-        
+
         {/* Centered Content */}
         <div
-          className="flex-1 flex flex-col items-center w-full mx-auto px-4 pl-12"
+          className="flex-1 flex flex-col items-center w-full mx-auto px-4"
           style={{
             maxWidth: `${tunerConfig?.mainContentWidth || 768}px`,
             marginTop: `${tunerConfig?.mainContentMt || 0}px`,
@@ -1505,11 +2414,11 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
             className="flex items-center gap-4"
             style={{ marginBottom: `${tunerConfig?.welcomeMb || 40}px` }}
           >
-            <div className="w-[48px] h-[48px] flex items-center justify-center translate-x-[16px] translate-y-[4px]">
+            <div className="w-[48px] h-[48px] shrink-0 flex items-center justify-center translate-x-[16px] translate-y-[4px]">
               <ClaudeLogo color="#D97757" />
             </div>
             <h1
-              className="text-claude-text tracking-tight leading-none pt-1 transition-all duration-100 ease-out whitespace-nowrap"
+              className="text-claude-text dark:!text-[#d6cec3] tracking-tight leading-none pt-1 transition-all duration-100 ease-out whitespace-nowrap"
               style={{
                 fontFamily: 'Optima, Candara, "Segoe UI", Segoe, "Humanist 521", sans-serif',
                 fontSize: '46px',
@@ -1545,7 +2454,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
                 <FileUploadPreview files={pendingFiles} onRemove={handleRemoveFile} />
                 <textarea
                   ref={inputRef}
-                  className="w-full pl-5 pr-4 pt-5 pb-1 text-claude-text placeholder:text-claude-textSecondary text-[16px] outline-none resize-none overflow-hidden bg-transparent font-sans"
+                  className="w-full pl-5 pr-4 pt-5 pb-1 text-claude-text placeholder:text-claude-textSecondary text-[16px] outline-none resize-none overflow-hidden bg-transparent font-sans font-[350]"
                   style={{ minHeight: '48px', borderRadius: `${tunerConfig?.inputRadius || 16}px ${tunerConfig?.inputRadius || 16}px 0 0` }}
                   placeholder="How can I help you today?"
                   value={inputText}
@@ -1571,12 +2480,13 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
                 <div className="flex items-center gap-3">
                   <ModelSelector
                     currentModelString={currentModelString}
+                    models={selectorModels}
                     onModelChange={handleModelChange}
                     isNewChat={true}
                   />
                   <button
                     onClick={handleSend}
-                    disabled={(!inputText.trim() && !pendingFiles.some(f => f.status === 'done')) || loading || pendingFiles.some(f => f.status === 'uploading') || hasSubscription === false}
+                    disabled={(!inputText.trim() && !pendingFiles.some(f => f.status === 'done')) || loading || pendingFiles.some(f => f.status === 'uploading')}
                     className="p-2 bg-[#C6613F] text-white rounded-lg hover:bg-[#D97757] transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
                   >
                     <ArrowUp size={22} strokeWidth={2.5} />
@@ -1584,7 +2494,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
                 </div>
               </div>
             </div>
-            {hasSubscription === false && (
+            {false && (
               <div className="mx-4 flex items-center justify-between px-4 py-1.5 bg-claude-bgSecondary border-x border-b border-claude-border rounded-b-xl text-claude-textSecondary text-xs">
                 <span>您当前没有可用套餐，无法发送消息</span>
                 <button
@@ -1608,12 +2518,12 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
       <div className="flex-1 min-h-0 relative">
         <div
           className="absolute inset-0 overflow-y-auto chat-scroll"
-          style={{ paddingBottom: '160px' }}
+          style={{ paddingBottom: `${inputHeight}px` }}
           ref={scrollContainerRef}
           onScroll={handleScroll}
         >
           <div
-            className="w-full mx-auto px-4 py-8 pb-32"
+            className="w-full mx-auto px-4 py-8 pb-2"
             style={{ maxWidth: `${tunerConfig?.mainContentWidth || 768}px` }}
           >
             <MessageList
@@ -1640,7 +2550,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
         </div>
 
         {/* 免责声明 - 固定在最底部 */}
-        <div className="absolute bottom-0 left-0 z-10 bg-claude-bg text-center text-[12px] text-claude-textSecondary py-2 pointer-events-none font-sans" style={{ right: `${scrollbarWidth}px` }}>
+        <div className="absolute bottom-0 left-0 z-10 bg-claude-bg flex items-center justify-center text-[12px] text-claude-textSecondary h-7 pointer-events-none font-sans" style={{ right: `${scrollbarWidth}px` }}>
           Claude is AI and can make mistakes. Please double-check responses.
         </div>
 
@@ -1650,7 +2560,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
             className="mx-auto pointer-events-auto"
             style={{ maxWidth: `${inputBarWidth}px` }}
           >
-            <div className="w-full relative group">
+            <div className="w-full relative group" ref={inputWrapperRef}>
               <input
                 type="file"
                 ref={fileInputRef}
@@ -1672,7 +2582,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
                 <FileUploadPreview files={pendingFiles} onRemove={handleRemoveFile} />
                 <textarea
                   ref={inputRef}
-                  className="w-full px-4 pt-4 pb-0 text-claude-text placeholder:text-claude-textSecondary text-[16px] outline-none resize-none bg-transparent font-sans"
+                  className="w-full px-4 pt-4 pb-0 text-claude-text placeholder:text-claude-textSecondary text-[16px] outline-none resize-none bg-transparent font-sans font-[350]"
                   style={{ height: `${inputBarBaseHeight}px`, minHeight: '16px', boxSizing: 'border-box', overflowY: 'hidden' }}
                   placeholder="How can I help you today?"
                   value={inputText}
@@ -1684,7 +2594,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
                   onPaste={handlePaste}
                 />
                 <div className="px-4 pb-3 pt-1 flex items-center justify-between">
-                  <div className="relative">
+                  <div className="relative flex items-center">
                     <button
                       ref={plusBtnRef}
                       onClick={() => setShowPlusMenu(prev => !prev)}
@@ -1715,6 +2625,9 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
                             try {
                               const result = await compactConversation(activeId);
                               await loadConversation(activeId);
+                              // 更新 context size
+                              const newContextInfo = await getContextSize(activeId);
+                              setContextInfo(newContextInfo);
                               setCompactStatus({ state: 'done', message: `Compacted ${result.messagesCompacted} messages, saved ~${result.tokensSaved} tokens` });
                               setTimeout(() => setCompactStatus({ state: 'idle' }), 4000);
                             } catch (err) {
@@ -1730,10 +2643,29 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
                         </button>
                       </div>
                     )}
+                    {contextInfo && contextInfo.tokens > 0 && (() => {
+                      const pct = Math.min(contextInfo.tokens / contextInfo.limit, 1);
+                      const color = pct > 0.8 ? '#dc2626' : pct > 0.5 ? '#d97706' : '#6b7280';
+                      const r = 7, c = 2 * Math.PI * r, dash = pct * c;
+                      const label = contextInfo.tokens.toLocaleString() + ' tokens';
+                      const pctLabel = (pct * 100).toFixed(1) + '% 上下文已使用';
+                      return (
+                        <div className="flex items-center gap-1 ml-1 select-none" title={pctLabel}>
+                          <svg width="18" height="18" viewBox="0 0 18 18">
+                            <circle cx="9" cy="9" r={r} fill="none" stroke="#d4d4d4" strokeWidth="2" />
+                            <circle cx="9" cy="9" r={r} fill="none" stroke={color} strokeWidth="2"
+                              strokeDasharray={`${dash} ${c}`} strokeLinecap="round"
+                              transform="rotate(-90 9 9)" />
+                          </svg>
+                          <span className="text-[11px] whitespace-nowrap" style={{ color: '#6b7280' }}>{label}</span>
+                        </div>
+                      );
+                    })()}
                   </div>
                   <div className="flex items-center gap-3">
                     <ModelSelector
                       currentModelString={currentModelString}
+                      models={selectorModels}
                       onModelChange={handleModelChange}
                       isNewChat={false}
                       dropdownPosition="top"
@@ -1761,16 +2693,16 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
                     ) : (
                       <button
                         onClick={handleSend}
-                        disabled={(!inputText.trim() && !pendingFiles.some(f => f.status === 'done')) || pendingFiles.some(f => f.status === 'uploading') || hasSubscription === false}
+                        disabled={(!inputText.trim() && !pendingFiles.some(f => f.status === 'done')) || pendingFiles.some(f => f.status === 'uploading')}
                         className="p-2 bg-[#C6613F] text-white rounded-lg hover:bg-[#D97757] transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
-                  >
-                    <ArrowUp size={22} strokeWidth={2.5} />
-                  </button>
+                      >
+                        <ArrowUp size={22} strokeWidth={2.5} />
+                      </button>
                     )}
                   </div>
                 </div>
               </div>
-              {hasSubscription === false && (
+              {false && (
                 <div className="mx-4 flex items-center justify-between px-4 py-1.5 bg-claude-bgSecondary border-x border-b border-claude-border rounded-b-xl text-claude-textSecondary text-xs pointer-events-auto">
                   <span>您当前没有可用套餐，无法发送消息</span>
                   <button

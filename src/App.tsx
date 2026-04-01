@@ -1,9 +1,10 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { BrowserRouter, Routes, Route, Navigate, useLocation, useParams, useNavigate } from 'react-router-dom';
-import { FileText, ChevronDown, Trash, Pencil, Star } from 'lucide-react';
+import { HashRouter, Routes, Route, Navigate, useLocation, useParams, useNavigate } from 'react-router-dom';
+import { FileText, ChevronDown, Trash, Pencil, Star, BellRing, Menu } from 'lucide-react';
 import Sidebar from './components/Sidebar';
 import MainContent from './components/MainContent';
-import { updateConversation, deleteConversation } from './api';
+import { IconSidebarToggle } from './components/Icons';
+import { updateConversation, deleteConversation, exportConversation, getUnreadAnnouncements, markAnnouncementRead } from './api';
 import Auth from './components/Auth';
 import SettingsPage from './components/SettingsPage';
 import UpgradePlan from './components/UpgradePlan';
@@ -18,6 +19,7 @@ import AdminUsers from './components/admin/AdminUsers';
 import AdminPlans from './components/admin/AdminPlans';
 import AdminRedemption from './components/admin/AdminRedemption';
 import AdminModels from './components/admin/AdminModels';
+import AdminAnnouncements from './components/admin/AdminAnnouncements';
 import ChatsPage from './components/ChatsPage';
 import CustomizePage from './components/CustomizePage';
 import ProjectsPage from './components/ProjectsPage';
@@ -42,6 +44,7 @@ const ChatHeader = ({
   const [isEditing, setIsEditing] = useState(false);
   const [editTitle, setEditTitle] = useState('');
   const [showMenu, setShowMenu] = useState(false);
+  const [isExporting, setIsExporting] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
   const buttonRef = useRef<HTMLButtonElement>(null);
 
@@ -49,7 +52,7 @@ const ChatHeader = ({
   useEffect(() => {
     const handleClickOutside = (event: MouseEvent) => {
       if (menuRef.current && !menuRef.current.contains(event.target as Node) &&
-          buttonRef.current && !buttonRef.current.contains(event.target as Node)) {
+        buttonRef.current && !buttonRef.current.contains(event.target as Node)) {
         setShowMenu(false);
       }
     };
@@ -106,7 +109,9 @@ const ChatHeader = ({
   };
 
   return (
-    <div className="relative flex items-center justify-between px-3 py-2 bg-claude-bg flex-shrink-0 h-12 border-b border-transparent z-40">
+    <div
+      className="relative flex items-center justify-between px-3 py-2 bg-claude-bg flex-shrink-0 h-[44px] border-b border-claude-border z-40"
+    >
       {isEditing ? (
         <input
           type="text"
@@ -116,16 +121,17 @@ const ChatHeader = ({
           onKeyDown={handleKeyDown}
           autoFocus
           className="max-w-[60%] px-2 py-1 text-[14px] font-medium text-claude-text bg-claude-input border border-blue-500 rounded-md outline-none shadow-sm"
+          style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}
         />
       ) : (
-        <div className="relative flex items-center gap-1">
-          <button 
+        <div className="relative flex items-center gap-1" style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}>
+          <button
             onClick={startEditing}
             className="flex items-center px-2 py-1.5 hover:bg-claude-btn-hover rounded-md transition-colors text-[14px] font-medium text-claude-text max-w-[200px] truncate group"
           >
             {title || 'New Chat'}
           </button>
-          
+
           <button
             ref={buttonRef}
             onClick={() => setShowMenu(!showMenu)}
@@ -133,9 +139,9 @@ const ChatHeader = ({
           >
             <ChevronDown size={14} />
           </button>
-          
+
           {showMenu && (
-            <div 
+            <div
               ref={menuRef}
               className="absolute top-full left-0 mt-1 z-50 bg-claude-input border border-claude-border rounded-xl shadow-[0_4px_12px_rgba(0,0,0,0.08)] py-1.5 flex flex-col w-[200px]"
             >
@@ -143,7 +149,7 @@ const ChatHeader = ({
                 <Star size={16} className="text-claude-textSecondary group-hover:text-claude-text" />
                 <span className="text-[13px] text-claude-text">Star</span>
               </button>
-              <button 
+              <button
                 onClick={(e) => {
                   e.stopPropagation();
                   startEditing();
@@ -179,8 +185,23 @@ const ChatHeader = ({
             <FileText size={18} strokeWidth={1.5} />
           </button>
         )}
-        <button className="px-3 py-1.5 text-[13px] font-medium text-claude-textSecondary hover:bg-claude-btn-hover rounded-md transition-colors border border-transparent hover:border-claude-border">
-          Share
+        <button
+          onClick={async () => {
+            if (!id || isExporting) return;
+            setIsExporting(true);
+            try {
+              await exportConversation(id);
+            } catch (err) {
+              console.error('导出失败', err);
+              window.alert(err instanceof Error ? err.message : '导出失败');
+            } finally {
+              setIsExporting(false);
+            }
+          }}
+          disabled={isExporting}
+          className="px-3 py-1.5 text-[13px] font-medium text-claude-textSecondary hover:bg-claude-btn-hover rounded-md transition-colors border border-transparent hover:border-claude-border disabled:opacity-50 disabled:cursor-not-allowed"
+        >
+          {isExporting ? '导出中…' : 'Export'}
         </button>
       </div>
       <div className="absolute top-full left-0 right-0 h-6 bg-gradient-to-b from-claude-bg to-transparent pointer-events-none z-30" />
@@ -189,11 +210,20 @@ const ChatHeader = ({
 };
 
 const Layout = () => {
+  const [unreadAnnouncements, setUnreadAnnouncements] = useState<Array<{
+    id: number;
+    title: string;
+    content: string;
+    created_at: string;
+    updated_at?: string;
+  }>>([]);
+  const [activeAnnouncementId, setActiveAnnouncementId] = useState<number | null>(null);
+  const [isMarkingAnnouncementRead, setIsMarkingAnnouncementRead] = useState(false);
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
   const [refreshTrigger, setRefreshTrigger] = useState(0);
   const [newChatKey, setNewChatKey] = useState(0);
-  const [authChecked, setAuthChecked] = useState(false);
-  const [authValid, setAuthValid] = useState(false);
+  const [authChecked, setAuthChecked] = useState(true);
+  const [authValid, setAuthValid] = useState(true);
   const [showSettings, setShowSettings] = useState(false);
   const [showUpgrade, setShowUpgrade] = useState(false);
 
@@ -206,6 +236,17 @@ const Layout = () => {
   const [currentChatTitle, setCurrentChatTitle] = useState('');
   const sidebarWasCollapsedRef = useRef(false);
   const contentContainerRef = useRef<HTMLDivElement>(null);
+
+  // Title bar height adjusts inversely to zoom so it stays visually constant
+  const [titleBarHeight, setTitleBarHeight] = useState(44);
+  useEffect(() => {
+    const api = (window as any).electronAPI;
+    if (api?.onZoomChanged) {
+      api.onZoomChanged((factor: number) => {
+        setTitleBarHeight(Math.round(44 / factor));
+      });
+    }
+  }, []);
 
   const location = useLocation();
 
@@ -223,65 +264,86 @@ const Layout = () => {
     return () => window.removeEventListener('open-upgrade', handler);
   }, []);
 
-  // Collapse sidebar on Customize page
+  // Collapse sidebar on Customize page (Removed per user request)
   useEffect(() => {
-    if (location.pathname === '/customize') {
-      setIsSidebarCollapsed(true);
-    }
+    // Intentionally empty: do not collapse left sidebar automatically
   }, [location.pathname]);
 
+  const isElectron = !!(window as any).electronAPI?.isElectron;
   useEffect(() => {
-    const token = localStorage.getItem('auth_token');
-    if (!token) {
-      setAuthChecked(true);
-      setAuthValid(false);
+    if (isElectron) {
+      // Electron: check if gateway API key exists
+      const hasKey = localStorage.getItem('ANTHROPIC_API_KEY') && localStorage.getItem('gateway_user');
+      if (!hasKey) {
+        setAuthValid(false);
+      }
+    }
+  }, [isElectron]);
+
+  const loadUnreadAnnouncements = useCallback(async () => {
+    try {
+      const data = await getUnreadAnnouncements();
+      setUnreadAnnouncements(Array.isArray(data?.announcements) ? data.announcements : []);
+    } catch (err) {
+      console.error('Failed to fetch announcements:', err);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!authValid) return;
+
+    loadUnreadAnnouncements();
+
+    const intervalId = window.setInterval(() => {
+      loadUnreadAnnouncements();
+    }, 15000);
+
+    const handleFocus = () => {
+      loadUnreadAnnouncements();
+    };
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        loadUnreadAnnouncements();
+      }
+    };
+
+    window.addEventListener('focus', handleFocus);
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+
+    return () => {
+      window.clearInterval(intervalId);
+      window.removeEventListener('focus', handleFocus);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+    };
+  }, [authValid, loadUnreadAnnouncements]);
+
+  useEffect(() => {
+    if (unreadAnnouncements.length === 0) {
+      if (activeAnnouncementId !== null) setActiveAnnouncementId(null);
       return;
     }
-    fetch('/api/user/profile', {
-      headers: { 'Authorization': `Bearer ${token}` },
-    }).then(res => {
-      if (res.ok) {
-        res.json().then(data => {
-          if (data.newToken) {
-            localStorage.setItem('auth_token', data.newToken);
-          }
-          if (data.theme) {
-            localStorage.setItem('theme', data.theme);
-            const root = document.documentElement;
-            if (data.theme === 'dark') {
-              root.classList.add('dark');
-              root.setAttribute('data-theme', 'dark');
-            } else if (data.theme === 'auto') {
-              const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
-              root.classList.toggle('dark', prefersDark);
-              root.setAttribute('data-theme', prefersDark ? 'dark' : 'light');
-            } else {
-              root.classList.remove('dark');
-              root.setAttribute('data-theme', 'light');
-            }
-          }
-          if (data.chat_font) {
-            localStorage.setItem('chat_font', data.chat_font);
-            document.documentElement.setAttribute('data-chat-font', data.chat_font);
-          }
-          if (data.default_model) {
-            localStorage.setItem('default_model', data.default_model);
-          }
-          setAuthValid(true);
-          setAuthChecked(true);
-        });
-      } else {
-        localStorage.removeItem('auth_token');
-        localStorage.removeItem('user');
-        setAuthValid(false);
-        setAuthChecked(true);
-      }
-    }).catch(() => {
-      // 网络错误时信任本地 token，避免离线时踢出
-      setAuthValid(true);
-      setAuthChecked(true);
-    });
-  }, []);
+
+    if (activeAnnouncementId === null || !unreadAnnouncements.some(item => item.id === activeAnnouncementId)) {
+      setActiveAnnouncementId(unreadAnnouncements[0].id);
+    }
+  }, [unreadAnnouncements, activeAnnouncementId]);
+
+  const activeAnnouncement = unreadAnnouncements.find(item => item.id === activeAnnouncementId) || null;
+
+  const handleAnnouncementRead = useCallback(async () => {
+    if (!activeAnnouncement || isMarkingAnnouncementRead) return;
+
+    setIsMarkingAnnouncementRead(true);
+    try {
+      await markAnnouncementRead(activeAnnouncement.id);
+      setUnreadAnnouncements(prev => prev.filter(item => item.id !== activeAnnouncement.id));
+    } catch (err: any) {
+      alert(err?.message || '公告已读失败，请稍后重试');
+    } finally {
+      setIsMarkingAnnouncementRead(false);
+    }
+  }, [activeAnnouncement, isMarkingAnnouncementRead]);
 
   const refreshSidebar = () => {
     setRefreshTrigger(prev => prev + 1);
@@ -363,7 +425,7 @@ const Layout = () => {
     recentsFontSize: 14,
     recentsItemPy: 7,
     recentsPl: 6,
-    userAvatarSize: 32,
+    userAvatarSize: 36,
     userNameSize: 15,
     headerPy: 0,
 
@@ -383,109 +445,179 @@ const Layout = () => {
   }
 
   return (
-    <div className="flex w-full h-screen overflow-hidden bg-claude-bg font-sans antialiased">
-      <Sidebar
-        isCollapsed={isSidebarCollapsed}
-        toggleSidebar={() => setIsSidebarCollapsed(!isSidebarCollapsed)}
-        refreshTrigger={refreshTrigger}
-        onNewChatClick={handleNewChat}
-        onOpenSettings={() => { setShowSettings(true); setShowUpgrade(false); }}
-        onOpenUpgrade={() => { setShowUpgrade(true); setShowSettings(false); }}
-        tunerConfig={tunerConfig}
-        setTunerConfig={setTunerConfig}
-      />
-
-      {/* Unified Content Wrapper - takes remaining space after sidebar */}
-      <div className="flex-1 flex flex-col h-full min-w-0 overflow-hidden">
-
-        {/* Header - moved to allow conditional placement (Full Width Mode) */}
-        {isChatMode && (showArtifacts && !documentPanelDoc) && !showSettings && !showUpgrade && (
-          <ChatHeader
-            title={currentChatTitle}
-            showArtifacts={showArtifacts}
-            documentPanelDoc={documentPanelDoc}
-            onOpenArtifacts={handleOpenArtifacts}
-            hasArtifacts={artifacts.length > 0}
-            onTitleRename={handleTitleChange}
-          />
-        )}
-
-        <div className="flex-1 flex overflow-hidden relative" ref={contentContainerRef}>
-
-          {/* Main Content Area - takes remaining width after panel */}
-          <div className="flex-1 flex flex-col h-full min-w-0">
-            {/* Header - Only render here if NOT in Artifacts-only mode */}
-            {isChatMode && (!showArtifacts || documentPanelDoc) && !showSettings && !showUpgrade && location.pathname !== '/chats' && location.pathname !== '/customize' && location.pathname !== '/projects' && (
-              <ChatHeader
-                title={currentChatTitle}
-                showArtifacts={showArtifacts}
-                documentPanelDoc={documentPanelDoc}
-                onOpenArtifacts={handleOpenArtifacts}
-                hasArtifacts={artifacts.length > 0}
-                onTitleRename={handleTitleChange}
-              />
-            )}
-
-            {showSettings ? (
-              <SettingsPage onClose={() => setShowSettings(false)} />
-            ) : showUpgrade ? (
-              <UpgradePlan onClose={() => setShowUpgrade(false)} />
-            ) : location.pathname === '/chats' ? (
-              <ChatsPage />
-            ) : location.pathname === '/customize' ? (
-              <CustomizePage />
-            ) : location.pathname === '/projects' ? (
-              <ProjectsPage />
-            ) : (
-              <MainContent
-                onNewChat={refreshSidebar}
-                resetKey={newChatKey}
-                tunerConfig={tunerConfig}
-                onOpenDocument={handleOpenDocument}
-                onArtifactsUpdate={handleArtifactsUpdate}
-                onOpenArtifacts={handleOpenArtifacts}
-                onTitleChange={handleTitleChange}
-                onChatModeChange={handleChatModeChange}
-              />
-            )}
-          </div>
-
-          {/* Animated Document Panel Container */}
+    <>
+      <div className="relative flex w-full h-screen overflow-hidden bg-claude-bg font-sans antialiased">
+        {/* Custom Solid Title Bar (Unified Full Width) */}
+        <div
+          className="absolute top-0 left-0 w-full z-50 flex items-center select-none pointer-events-none bg-claude-bg border-b border-claude-border transition-all duration-300"
+          style={{ WebkitAppRegion: 'drag', height: `${titleBarHeight}px` } as React.CSSProperties}
+        >
+          {/* Left Controls inside Title Bar */}
           <div
-            className={`h-full bg-claude-bg transition-all duration-300 ease-out flex z-20 ${showArtifacts ? 'border border-claude-border rounded-2xl mr-2 ml-4' : ''}`}
-            style={{
-              width: documentPanelDoc ? `${documentPanelWidth}%` : showArtifacts ? '420px' : '0px',
-              opacity: (documentPanelDoc || showArtifacts) ? 1 : 0,
-              overflow: 'hidden'
-            }}
+            className="h-full flex items-center pl-1 pr-2 gap-0.5"
+            style={{ pointerEvents: 'auto', WebkitAppRegion: 'no-drag' } as React.CSSProperties}
           >
-            <div className={`w-full h-full flex relative min-w-0`}>
-              {(documentPanelDoc || showArtifacts) && (
-                <>
-                  {documentPanelDoc ? <DraggableDivider onResize={setDocumentPanelWidth} containerRef={contentContainerRef} /> : null}
-                  {documentPanelDoc ? (
-                    <DocumentPanel document={documentPanelDoc} onClose={handleCloseDocument} />
-                  ) : (
-                    <ArtifactsPanel
-                      documents={artifacts}
-                      onClose={handleCloseArtifacts}
-                      onOpenDocument={handleOpenDocument}
-                    />
-                  )}
-                </>
+            <button
+              onClick={() => { }}
+              className="p-2 hover:bg-black/5 dark:hover:bg-white/5 rounded-md text-claude-textSecondary hover:text-claude-text transition-colors"
+              title="Menu"
+            >
+              <Menu size={18} className="opacity-80" />
+            </button>
+            <button
+              onClick={() => setIsSidebarCollapsed(!isSidebarCollapsed)}
+              className="p-1.5 hover:bg-black/5 dark:hover:bg-white/5 rounded-md text-claude-textSecondary hover:text-claude-text transition-colors"
+              title={isSidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
+            >
+              <IconSidebarToggle size={26} className="dark:invert transition-[filter] duration-200" />
+            </button>
+          </div>
+        </div>
+
+        <Sidebar
+          isCollapsed={isSidebarCollapsed}
+          toggleSidebar={() => setIsSidebarCollapsed(!isSidebarCollapsed)}
+          refreshTrigger={refreshTrigger}
+          onNewChatClick={handleNewChat}
+          onOpenSettings={() => { setShowSettings(true); setShowUpgrade(false); }}
+          onOpenUpgrade={() => { setShowUpgrade(true); setShowSettings(false); }}
+          onCloseOverlays={() => { setShowSettings(false); setShowUpgrade(false); }}
+          tunerConfig={tunerConfig}
+          setTunerConfig={setTunerConfig}
+        />
+
+        {/* Unified Content Wrapper - takes remaining space after sidebar */}
+        <div className="flex-1 flex flex-col h-full min-w-0 overflow-hidden relative" style={{ paddingTop: `${titleBarHeight}px` }}>
+          {/* Header - moved to allow conditional placement (Full Width Mode) */}
+          {isChatMode && (showArtifacts && !documentPanelDoc) && !showSettings && !showUpgrade && (
+            <ChatHeader
+              title={currentChatTitle}
+              showArtifacts={showArtifacts}
+              documentPanelDoc={documentPanelDoc}
+              onOpenArtifacts={handleOpenArtifacts}
+              hasArtifacts={artifacts.length > 0}
+              onTitleRename={handleTitleChange}
+            />
+          )}
+
+          <div className="flex-1 flex overflow-hidden relative" ref={contentContainerRef}>
+
+            {/* Main Content Area - takes remaining width after panel */}
+            <div className="flex-1 flex flex-col h-full min-w-0">
+              {/* Header - Only render here if NOT in Artifacts-only mode */}
+              {isChatMode && (!showArtifacts || documentPanelDoc) && !showSettings && !showUpgrade && location.pathname !== '/chats' && location.pathname !== '/customize' && location.pathname !== '/projects' && (
+                <ChatHeader
+                  title={currentChatTitle}
+                  showArtifacts={showArtifacts}
+                  documentPanelDoc={documentPanelDoc}
+                  onOpenArtifacts={handleOpenArtifacts}
+                  hasArtifacts={artifacts.length > 0}
+                  onTitleRename={handleTitleChange}
+                />
+              )}
+
+              {showSettings ? (
+                <SettingsPage onClose={() => setShowSettings(false)} />
+              ) : showUpgrade ? (
+                <UpgradePlan onClose={() => setShowUpgrade(false)} />
+              ) : location.pathname === '/chats' ? (
+                <ChatsPage />
+              ) : location.pathname === '/customize' ? (
+                <CustomizePage />
+              ) : location.pathname === '/projects' ? (
+                <ProjectsPage />
+              ) : (
+                <MainContent
+                  onNewChat={refreshSidebar}
+                  resetKey={newChatKey}
+                  tunerConfig={tunerConfig}
+                  onOpenDocument={handleOpenDocument}
+                  onArtifactsUpdate={handleArtifactsUpdate}
+                  onOpenArtifacts={handleOpenArtifacts}
+                  onTitleChange={handleTitleChange}
+                  onChatModeChange={handleChatModeChange}
+                />
               )}
             </div>
-          </div>
 
+            {/* Animated Document Panel Container */}
+            <div
+              className={`h-full bg-claude-bg transition-all duration-300 ease-out flex z-20 relative ${showArtifacts ? 'border border-claude-border rounded-2xl mr-2 ml-4' : ''}`}
+              style={{
+                width: documentPanelDoc ? `${documentPanelWidth}%` : showArtifacts ? '420px' : '0px',
+                opacity: (documentPanelDoc || showArtifacts) ? 1 : 0,
+                overflow: showArtifacts ? 'hidden' : 'visible'
+              }}
+            >
+              {documentPanelDoc && (
+                <div className="absolute left-0 top-0 bottom-0 h-full z-50">
+                  <DraggableDivider onResize={setDocumentPanelWidth} containerRef={contentContainerRef} />
+                </div>
+              )}
+              <div className={`w-full h-full flex relative min-w-0 overflow-hidden`}>
+                {(documentPanelDoc || showArtifacts) && (
+                  <>
+                    {documentPanelDoc ? (
+                      <DocumentPanel document={documentPanelDoc} onClose={handleCloseDocument} />
+                    ) : (
+                      <ArtifactsPanel
+                        documents={artifacts}
+                        onClose={handleCloseArtifacts}
+                        onOpenDocument={handleOpenDocument}
+                      />
+                    )}
+                  </>
+                )}
+              </div>
+            </div>
+
+          </div>
         </div>
       </div>
-    </div>
+      {activeAnnouncement && (
+        <div className="fixed inset-0 z-[120] flex items-center justify-center bg-black/45 px-4">
+          <div className="w-full max-w-2xl rounded-2xl bg-white dark:bg-[#1F1F1F] shadow-2xl border border-black/5 dark:border-white/10">
+            <div className="flex items-center gap-3 px-6 py-5 border-b border-gray-100 dark:border-white/10">
+              <div className="w-10 h-10 rounded-full bg-blue-50 text-blue-600 dark:bg-blue-500/15 dark:text-blue-300 flex items-center justify-center shrink-0">
+                <BellRing size={20} />
+              </div>
+              <div className="min-w-0">
+                <h3 className="text-[18px] font-semibold text-gray-900 dark:text-white break-words">{activeAnnouncement.title}</h3>
+                <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
+                  系统公告 · {activeAnnouncement.created_at?.slice(0, 16).replace('T', ' ') || ''}
+                </p>
+              </div>
+            </div>
+            <div className="px-6 py-5">
+              <div className="max-h-[50vh] overflow-y-auto whitespace-pre-wrap break-words text-[15px] leading-7 text-gray-700 dark:text-gray-200">
+                {activeAnnouncement.content}
+              </div>
+              <div className="mt-4 text-xs text-gray-500 dark:text-gray-400">
+                点击右下角“已读”后，后续将不再重复弹出这条公告。
+              </div>
+            </div>
+            <div className="flex items-center justify-between px-6 py-4 border-t border-gray-100 dark:border-white/10">
+              <div className="text-xs text-gray-400 dark:text-gray-500">
+                {unreadAnnouncements.length > 1 ? `还有 ${unreadAnnouncements.length - 1} 条未读公告` : '暂无其他未读公告'}
+              </div>
+              <button
+                onClick={handleAnnouncementRead}
+                disabled={isMarkingAnnouncementRead}
+                className="px-5 py-2.5 text-sm font-medium text-white bg-blue-600 hover:bg-blue-700 rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                {isMarkingAnnouncementRead ? '处理中...' : '已读'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </>
   );
 };
 
 const App = () => {
   return (
-    <BrowserRouter>
+    <HashRouter>
       <Routes>
         <Route path="/login" element={<Auth />} />
         <Route path="/admin" element={<AdminLayout />}>
@@ -493,6 +625,7 @@ const App = () => {
           <Route path="keys" element={<AdminKeyPool />} />
           <Route path="models" element={<AdminModels />} />
           <Route path="users" element={<AdminUsers />} />
+          <Route path="announcements" element={<AdminAnnouncements />} />
           <Route path="plans" element={<AdminPlans />} />
           <Route path="redemption" element={<AdminRedemption />} />
         </Route>
@@ -503,7 +636,7 @@ const App = () => {
         <Route path="/chat/:id" element={<Layout />} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>
-    </BrowserRouter>
+    </HashRouter>
   );
 };
 

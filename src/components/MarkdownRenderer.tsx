@@ -259,11 +259,91 @@ const MarkdownRenderer: React.FC<MarkdownRendererProps> = ({ content, citations,
   // 角标通过 SourcesList 和内联 badge 展示
 
   return (
-    <div className="markdown-body text-claude-text text-[16.5px] leading-normal overflow-x-hidden">
+    <div
+      className="markdown-body assistant-markdown text-[16.5px] leading-normal overflow-x-hidden"
+      style={{ color: 'var(--text-claude-model-body)' }}
+    >
       <ReactMarkdown
         remarkPlugins={[remarkGfm, remarkMath]}
         rehypePlugins={[[rehypeKatex, { throwOnError: false, strict: 'ignore' }]]}
         components={{
+          h1({ children, ...props }: any) {
+            return (
+              <h1
+                className="mt-7 mb-3 text-[25px] leading-[1.2] font-bold tracking-[-0.02em]"
+                style={{ color: 'var(--text-claude-model-body)' }}
+                {...props}
+              >
+                {children}
+              </h1>
+            );
+          },
+          h2({ children, ...props }: any) {
+            return (
+              <h2
+                className="mt-6 mb-3 text-[21px] leading-[1.25] font-bold tracking-[-0.015em]"
+                style={{ color: 'var(--text-claude-model-body)' }}
+                {...props}
+              >
+                {children}
+              </h2>
+            );
+          },
+          h3({ children, ...props }: any) {
+            return (
+              <h3
+                className="mt-5 mb-2.5 text-[18px] leading-[1.3] font-semibold"
+                style={{ color: 'var(--text-claude-model-body)' }}
+                {...props}
+              >
+                {children}
+              </h3>
+            );
+          },
+          h4({ children, ...props }: any) {
+            return (
+              <h4
+                className="mt-4 mb-2 text-[16.8px] leading-[1.35] font-semibold"
+                style={{ color: 'var(--text-claude-model-body)' }}
+                {...props}
+              >
+                {children}
+              </h4>
+            );
+          },
+          h5({ children, ...props }: any) {
+            return (
+              <h5
+                className="mt-3.5 mb-2 text-[15.8px] leading-[1.4] font-semibold"
+                style={{ color: 'var(--text-claude-model-body)' }}
+                {...props}
+              >
+                {children}
+              </h5>
+            );
+          },
+          h6({ children, ...props }: any) {
+            return (
+              <h6
+                className="mt-3 mb-2 text-[15px] leading-[1.4] font-semibold uppercase tracking-[0.02em] opacity-90"
+                style={{ color: 'var(--text-claude-model-body)' }}
+                {...props}
+              >
+                {children}
+              </h6>
+            );
+          },
+          p({ children, ...props }: any) {
+            return (
+              <p
+                className="mb-2.5 text-[16.5px] leading-[1.7]"
+                style={{ color: 'var(--text-claude-model-body)' }}
+                {...props}
+              >
+                {children}
+              </p>
+            );
+          },
           pre({ children, ...props }: any) {
             return <>{children}</>;
           },
@@ -287,10 +367,10 @@ const MarkdownRenderer: React.FC<MarkdownRendererProps> = ({ content, citations,
             return <tr className="border-b border-black dark:border-white last:border-b-0" {...props}>{children}</tr>;
           },
           th({ children, ...props }: any) {
-            return <th className="text-left py-2 pr-4 font-semibold text-claude-text" {...props}>{children}</th>;
+            return <th className="text-left py-2 pr-4 font-semibold" style={{ color: 'var(--text-claude-model-body)' }} {...props}>{children}</th>;
           },
           td({ children, ...props }: any) {
-            return <td className="py-2 pr-4 text-claude-text" {...props}>{children}</td>;
+            return <td className="py-2 pr-4" style={{ color: 'var(--text-claude-model-body)' }} {...props}>{children}</td>;
           },
           code({ node, className, children, ...props }: any) {
             const isBlock = className?.startsWith('language-') || (node?.position?.start?.line !== node?.position?.end?.line);
@@ -300,7 +380,7 @@ const MarkdownRenderer: React.FC<MarkdownRendererProps> = ({ content, citations,
               return <CodeBlock language={language} code={codeText} className={className} {...props} />;
             }
             return (
-              <code className="inline-code px-1.5 py-0.5 rounded-md text-[14.5px] font-mono border border-transparent leading-none" {...props}>
+              <code className="inline-code px-1.5 py-0 rounded-md text-[14.5px] font-mono border border-transparent leading-none" {...props}>
                 {children}
               </code>
             );

@@ -5,6 +5,7 @@ import { CitationSource } from './MarkdownRenderer';
 interface SearchLog {
   query: string;
   results: CitationSource[];
+  tokens?: number;
 }
 
 interface SearchProcessProps {
@@ -104,6 +105,9 @@ const SearchProcess: React.FC<SearchProcessProps> = ({ logs, isThinking, isDone 
   const [isExpanded, setIsExpanded] = useState(!isDone);
   const containerRef = useRef<HTMLDivElement>(null);
 
+  // 计算总 token 数
+  const totalTokens = logs.reduce((sum, log) => sum + (log.tokens || 0), 0);
+
   useEffect(() => {
     if (isDone) {
       setIsExpanded(false);
@@ -119,16 +123,16 @@ const SearchProcess: React.FC<SearchProcessProps> = ({ logs, isThinking, isDone 
   if (!logs || logs.length === 0) return null;
 
   return (
-    <div className="mb-4 font-sans">
+    <div className="mb-2 font-sans">
       <div 
-        className="flex items-center gap-2 text-claude-textSecondary text-[13px] cursor-pointer hover:text-claude-text transition-colors select-none mb-2"
+        className="flex items-center gap-2 text-claude-textSecondary text-[14px] cursor-pointer hover:text-claude-text transition-colors select-none mb-1"
         onClick={() => setIsExpanded(!isExpanded)}
       >
-        <ChevronDown 
-          size={16} 
-          className={`transform transition-transform duration-200 ${isExpanded ? 'rotate-0' : '-rotate-90'}`}
-        />
         <span>Searched the web</span>
+        <ChevronDown 
+          size={14} 
+          className={`transform transition-transform duration-200 ${isExpanded ? 'rotate-180' : ''}`}
+        />
       </div>
 
       <div 
@@ -149,6 +153,9 @@ const SearchProcess: React.FC<SearchProcessProps> = ({ logs, isThinking, isDone 
               </div>
               <div className="flex items-center gap-2 text-claude-textSecondary">
                 <span className="text-[13px]">Done</span>
+                {totalTokens > 0 && (
+                  <span className="text-[11px] text-[#888]">· {totalTokens.toLocaleString()} tokens</span>
+                )}
               </div>
             </div>
           )}

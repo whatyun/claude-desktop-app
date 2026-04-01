@@ -41,6 +41,9 @@ export const updateKey = (id: number, data: any) => adminRequest(`/keys/${id}`, 
 export const deleteKey = (id: number) => adminRequest(`/keys/${id}`, { method: 'DELETE' });
 export const toggleKey = (id: number) => adminRequest(`/keys/${id}/toggle`, { method: 'POST' });
 export const getPoolStatus = () => adminRequest('/keys/pool-status');
+export const getUpstreamRoutes = () => adminRequest('/upstream-routes');
+export const updateUpstreamRoutes = (routes: any) =>
+  adminRequest('/upstream-routes', { method: 'PUT', body: JSON.stringify({ routes }) });
 
 // Users
 export const getUsers = (params: Record<string, any> = {}) => {
@@ -63,6 +66,17 @@ export const addPlan = (data: any) => adminRequest('/plans', { method: 'POST', b
 export const updatePlan = (id: number, data: any) => adminRequest(`/plans/${id}`, { method: 'PUT', body: JSON.stringify(data) });
 export const deletePlan = (id: number) => adminRequest(`/plans/${id}`, { method: 'DELETE' });
 export const togglePlan = (id: number) => adminRequest(`/plans/${id}/toggle`, { method: 'POST' });
+
+// Announcements
+export const getAnnouncements = () => adminRequest('/announcements');
+export const addAnnouncement = (data: any) =>
+  adminRequest('/announcements', { method: 'POST', body: JSON.stringify(data) });
+export const updateAnnouncement = (id: number, data: any) =>
+  adminRequest(`/announcements/${id}`, { method: 'PUT', body: JSON.stringify(data) });
+export const deleteAnnouncement = (id: number) =>
+  adminRequest(`/announcements/${id}`, { method: 'DELETE' });
+export const toggleAnnouncement = (id: number) =>
+  adminRequest(`/announcements/${id}/toggle`, { method: 'POST' });
 
 // Redemption
 export const generateRedemptionCodes = (data: any) =>
@@ -88,3 +102,6 @@ export const getModels = () => adminRequest('/models');
 export const addModel = (data: any) => adminRequest('/models', { method: 'POST', body: JSON.stringify(data) });
 export const updateModel = (id: string, data: any) => adminRequest(`/models/${encodeURIComponent(id)}`, { method: 'PUT', body: JSON.stringify(data) });
 export const deleteModel = (id: string) => adminRequest(`/models/${encodeURIComponent(id)}`, { method: 'DELETE' });
+export const getCommonModelsConfig = () => adminRequest('/models/common');
+export const updateCommonModelsConfig = (model_ids: string[]) =>
+  adminRequest('/models/common', { method: 'PUT', body: JSON.stringify({ model_ids }) });

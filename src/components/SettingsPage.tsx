@@ -45,17 +45,20 @@ const SettingsPage = ({ onClose }: SettingsPageProps) => {
   const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number; sessionId: string } | null>(null);
   const [sendKey, setSendKey] = useState(localStorage.getItem('sendKey') || 'enter'); // enter or ctrl+enter
   const [newlineKey, setNewlineKey] = useState(localStorage.getItem('newlineKey') || (localStorage.getItem('sendKey') === 'enter' ? 'shift_enter' : 'enter'));
+  const [envToken, setEnvToken] = useState(localStorage.getItem('CUSTOM_API_KEY') || '');
+  const [envBaseUrl, setEnvBaseUrl] = useState(localStorage.getItem('CUSTOM_BASE_URL') || '');
 
   useEffect(() => {
-    getUserProfile().then(data => {
-      setProfile(data);
-      setFullName(data.full_name || data.nickname || '');
-      setDisplayName(data.display_name || data.nickname || '');
-      setWorkFunction(data.work_function || '');
-      setPersonalPreferences(data.personal_preferences || '');
-      setTheme(data.theme || 'light');
-      setChatFont(data.chat_font || 'default');
-      setDefaultModel(data.default_model || 'claude-opus-4-6-thinking');
+    getUserProfile().then((data: any) => {
+      const p = data?.user || data;
+      setProfile(p);
+      setFullName(p?.full_name || p?.nickname || '');
+      setDisplayName(p?.display_name || p?.nickname || '');
+      setWorkFunction(p?.work_function || '');
+      setPersonalPreferences(p?.personal_preferences || '');
+      setTheme(p?.theme || 'light');
+      setChatFont(p?.chat_font || 'default');
+      setDefaultModel(p?.default_model || 'claude-opus-4-6-thinking');
     }).catch(() => { });
     getUserUsage().then(setUsage).catch(() => { });
     getSessions().then(data => {
@@ -85,6 +88,7 @@ const SettingsPage = ({ onClose }: SettingsPageProps) => {
         const user = JSON.parse(userStr);
         localStorage.setItem('user', JSON.stringify({ ...user, ...data }));
       }
+      window.dispatchEvent(new Event('userProfileUpdated'));
       if (!silent) {
         setSaveMsg('已保存');
         setTimeout(() => setSaveMsg(''), 2000);
@@ -253,10 +257,10 @@ const SettingsPage = ({ onClose }: SettingsPageProps) => {
       if (!/Z$|[+-]\d{2}:?\d{2}$/.test(timeStr)) {
         timeStr += 'Z';
       }
-      
+
       const d = new Date(timeStr);
       if (isNaN(d.getTime())) return 'Invalid Date';
-      
+
       return d.toLocaleString('en-US', {
         month: 'short',
         day: 'numeric',
@@ -308,11 +312,11 @@ const SettingsPage = ({ onClose }: SettingsPageProps) => {
                 {pwdError && <div className="p-2 mb-3 bg-red-50 text-red-600 text-[13px] rounded-lg">{pwdError}</div>}
                 <div className="space-y-3">
                   <input type="password" value={pwdCurrent} onChange={e => setPwdCurrent(e.target.value)}
-                    placeholder="当前密码" className="w-full px-3 py-2 bg-claude-input border border-claude-border rounded-lg text-[14px] text-claude-text focus:outline-none focus:border-[#D97757] focus:ring-1 focus:ring-[#D97757]" />
+                    placeholder="当前密码" className="w-full px-3 py-2 bg-claude-input border border-claude-border rounded-lg text-[14px] text-claude-text focus:outline-none focus:border-[#387ee0] focus:ring-0" />
                   <input type="password" value={pwdNew} onChange={e => setPwdNew(e.target.value)}
-                    placeholder="新密码（至少 6 位）" className="w-full px-3 py-2 bg-claude-input border border-claude-border rounded-lg text-[14px] text-claude-text focus:outline-none focus:border-[#D97757] focus:ring-1 focus:ring-[#D97757]" />
+                    placeholder="新密码（至少 6 位）" className="w-full px-3 py-2 bg-claude-input border border-claude-border rounded-lg text-[14px] text-claude-text focus:outline-none focus:border-[#387ee0] focus:ring-0" />
                   <input type="password" value={pwdConfirm} onChange={e => setPwdConfirm(e.target.value)}
-                    placeholder="确认新密码" className="w-full px-3 py-2 bg-claude-input border border-claude-border rounded-lg text-[14px] text-claude-text focus:outline-none focus:border-[#D97757] focus:ring-1 focus:ring-[#D97757]" />
+                    placeholder="确认新密码" className="w-full px-3 py-2 bg-claude-input border border-claude-border rounded-lg text-[14px] text-claude-text focus:outline-none focus:border-[#387ee0] focus:ring-0" />
                 </div>
                 <div className="flex gap-3 pt-5 justify-end">
                   <button onClick={(e) => { e.preventDefault(); setShowPwdForm(false); setPwdError(''); setPwdCurrent(''); setPwdNew(''); setPwdConfirm(''); }}
@@ -474,7 +478,7 @@ const SettingsPage = ({ onClose }: SettingsPageProps) => {
                     value={fullName}
                     onChange={e => setFullName(e.target.value)}
                     onBlur={() => handleSave(true)}
-                    className="flex-1 px-3 py-2 bg-claude-input border border-claude-border rounded-md text-[14px] text-claude-text focus:outline-none focus:border-blue-600 focus:ring-1 focus:ring-blue-600 transition-all"
+                    className="flex-1 px-3 py-2 bg-claude-input border border-claude-border rounded-md text-[14px] text-claude-text focus:outline-none focus:border-[#387ee0] focus:ring-0 transition-all"
                     placeholder="输入你的全名"
                   />
                 </div>
@@ -487,67 +491,50 @@ const SettingsPage = ({ onClose }: SettingsPageProps) => {
                   value={displayName}
                   onChange={e => setDisplayName(e.target.value)}
                   onBlur={() => handleSave(true)}
-                  className="w-full px-3 py-2 bg-claude-input border border-claude-border rounded-md text-[14px] text-claude-text focus:outline-none focus:border-blue-600 focus:ring-1 focus:ring-blue-600 transition-all"
+                  className="w-full px-3 py-2 bg-claude-input border border-claude-border rounded-md text-[14px] text-claude-text focus:outline-none focus:border-[#387ee0] focus:ring-0 transition-all"
                   placeholder="例如你的名字或昵称"
                 />
               </div>
             </div>
 
+            <hr className="border-claude-border" />
+
+            {/* API Settings Section */}
             <div>
-              <label className="block text-[13px] font-medium text-claude-textSecondary mb-1.5">哪项最能描述你的工作？</label>
-              <div className="relative">
-                <select
-                  value={workFunction}
-                  onChange={e => {
-                    setWorkFunction(e.target.value);
-                    // Need to call save immediately for select if we want prompt response, 
-                    // but React state update is async. Better to handle this in a useEffect or 
-                    // just fire save with the new value directly if refactoring deeply.
-                    // For now, simpler: user selects -> onBlur triggers or timeout? 
-                    // Actually select doesn't blur easily on selection.
-                    // Let's trigger save in the onChange handler via a timeout or useEffect dependency.
-                    // But wait, handleSave reads from state. 
-                    // So we might need to modify handleSave to accept params or wait.
-                    // A simple way: pass the value directly to update.
-                    updateUserProfile({ work_function: e.target.value });
-                  }}
-                  className="w-full px-3 py-2 bg-claude-input border border-claude-border rounded-md text-[14px] text-claude-text focus:outline-none focus:border-blue-600 focus:ring-1 focus:ring-blue-600 appearance-none transition-all"
-                >
-                  <option value="">选择你的工作类型</option>
-                  {WORK_OPTIONS.filter(Boolean).map(opt => (
-                    <option key={opt} value={opt}>{opt}</option>
-                  ))}
-                </select>
-                <div className="absolute right-3 top-1/2 -translate-y-1/2 pointer-events-none text-claude-textSecondary">
-                  <svg width="10" height="6" viewBox="0 0 10 6" fill="none" xmlns="http://www.w3.org/2000/svg">
-                    <path d="M1 1L5 5L9 1" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
-                  </svg>
+              <h4 className="text-[14px] font-semibold text-claude-text mb-4">API 设置 (Claude Code Engine)</h4>
+
+              <div className="space-y-4">
+                <div>
+                  <label className="block text-[13px] font-medium text-claude-textSecondary mb-1.5">自定义 API Key（留空则使用账号自带额度）</label>
+                  <input
+                    type="text"
+                    value={envToken}
+                    onChange={e => {
+                      setEnvToken(e.target.value);
+                      localStorage.setItem('CUSTOM_API_KEY', e.target.value.trim());
+                    }}
+                    className="w-full px-3 py-2 bg-claude-input border border-claude-border rounded-md text-[14px] text-claude-text focus:outline-none focus:border-[#387ee0] focus:ring-0 transition-all"
+                    placeholder="留空即可，填写后将使用你自己的中转 API"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-[13px] font-medium text-claude-textSecondary mb-1.5">自定义 Base URL（配合自定义 Key 使用）</label>
+                  <input
+                    type="text"
+                    value={envBaseUrl}
+                    onChange={e => {
+                      setEnvBaseUrl(e.target.value);
+                      localStorage.setItem('CUSTOM_BASE_URL', e.target.value.trim());
+                    }}
+                    className="w-full px-3 py-2 bg-claude-input border border-claude-border rounded-md text-[14px] text-claude-text focus:outline-none focus:border-[#387ee0] focus:ring-0 transition-all"
+                    placeholder="留空即可，填写后将使用你指定的 API 地址"
+                  />
                 </div>
               </div>
             </div>
 
-            <div>
-              <label className="block text-[13px] font-medium text-claude-textSecondary mb-1.5">
-                Claude 在回复中应考虑哪些个人偏好？
-              </label>
-              <textarea
-                value={personalPreferences}
-                onChange={e => setPersonalPreferences(e.target.value)}
-                onBlur={() => handleSave(true)}
-                maxLength={2000}
-                rows={4}
-                className="w-full px-3 py-2 bg-claude-input border border-claude-border rounded-md text-[14px] text-claude-text focus:outline-none focus:border-blue-600 focus:ring-1 focus:ring-blue-600 resize-none transition-all"
-                placeholder="例如：学习新概念时，我觉得类比特别有帮助"
-              />
-              <div className="flex justify-between items-center mt-1.5">
-                <span className="text-[13px] text-[#4B9C68] h-5 flex items-center gap-1 transition-opacity duration-300" style={{ opacity: saveMsg ? 1 : 0 }}>
-                  <Check size={14} /> 已保存
-                </span>
-                <span className="text-[12px] text-claude-textSecondary">{personalPreferences.length}/2000</span>
-              </div>
-            </div>
 
-            {/* Save Button Removed for Auto-Save */}
           </div>
         </section>
 
@@ -563,7 +550,7 @@ const SettingsPage = ({ onClose }: SettingsPageProps) => {
                 <select
                   value={defaultModelBase}
                   onChange={e => applyDefaultModel(e.target.value, defaultModelIsThinking)}
-                  className="w-full px-3 py-2 bg-claude-input border border-claude-border rounded-md text-[14px] text-claude-text focus:outline-none focus:border-blue-600 appearance-none transition-all"
+                  className="w-full px-3 py-2 bg-claude-input border border-claude-border rounded-md text-[14px] text-claude-text focus:outline-none focus:border-[#387ee0] focus:ring-0 appearance-none transition-all"
                 >
                   {MODEL_BASES.map(m => (
                     <option key={m.base} value={m.base}>{m.label}</option>
@@ -614,7 +601,7 @@ const SettingsPage = ({ onClose }: SettingsPageProps) => {
                       localStorage.setItem('newlineKey', 'enter');
                     }
                   }}
-                  className="w-full px-3 py-2 bg-claude-input border border-claude-border rounded-md text-[14px] text-claude-text focus:outline-none focus:border-blue-600 focus:ring-1 focus:ring-blue-600 appearance-none transition-all"
+                  className="w-full px-3 py-2 bg-claude-input border border-claude-border rounded-md text-[14px] text-claude-text focus:outline-none focus:border-[#387ee0] focus:ring-0 appearance-none transition-all"
                 >
                   <option value="enter">Enter</option>
                   <option value="ctrl_enter">Ctrl+Enter</option>
@@ -639,7 +626,7 @@ const SettingsPage = ({ onClose }: SettingsPageProps) => {
                     setNewlineKey(val);
                     localStorage.setItem('newlineKey', val);
                   }}
-                  className="w-full px-3 py-2 bg-claude-input border border-claude-border rounded-md text-[14px] text-claude-text focus:outline-none focus:border-blue-600 focus:ring-1 focus:ring-blue-600 appearance-none transition-all"
+                  className="w-full px-3 py-2 bg-claude-input border border-claude-border rounded-md text-[14px] text-claude-text focus:outline-none focus:border-[#387ee0] focus:ring-0 appearance-none transition-all"
                 >
                   <option value="enter">Enter</option>
                   <option value="shift_enter">Shift+Enter</option>
@@ -971,7 +958,7 @@ const SettingsPage = ({ onClose }: SettingsPageProps) => {
         </section>
       </div>
     );
-};
+  };
 }
 
 export default SettingsPage;

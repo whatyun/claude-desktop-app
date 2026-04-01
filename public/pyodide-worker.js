@@ -72,11 +72,18 @@ os.makedirs('/data', exist_ok=True)
   for (const file of files) {
     try {
       const response = await fetch(file.url);
+      if (!response.ok) {
+        let detail = '';
+        try {
+          detail = (await response.text()).slice(0, 120);
+        } catch {}
+        throw new Error(`HTTP ${response.status}${detail ? `: ${detail}` : ''}`);
+      }
       const buffer = await response.arrayBuffer();
       const uint8 = new Uint8Array(buffer);
       pyodide.FS.writeFile('/data/' + file.name, uint8);
     } catch (e) {
-      console.warn('Failed to download file:', file.name, e);
+      throw new Error(`下载文件失败 ${file.name}: ${e.message || String(e)}`);
     }
   }
 }

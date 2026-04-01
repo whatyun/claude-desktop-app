@@ -1,173 +1,75 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { ChevronDown, ChevronRight, Check } from 'lucide-react';
+import { ChevronDown, Check, ChevronRight } from 'lucide-react';
 
-interface ModelDef {
-  id: string; // Internal ID like 'opus-4.6'
-  name: string; // Display name 'Opus 4.6'
-  desc: string;
-  baseValue: string; // 'claude-opus-4-6'
-  thinkingValue: string; // 'claude-opus-4-6-thinking'
+export interface SelectableModel {
+  id: string;
+  name: string;
+  enabled: number;
 }
 
-const MODELS: ModelDef[] = [
-  {
-    id: 'opus-4.6',
-    name: 'Opus 4.6',
-    desc: 'Most capable for ambitious work',
-    baseValue: 'claude-opus-4-6',
-    thinkingValue: 'claude-opus-4-6-thinking'
-  },
-  {
-    id: 'sonnet-4.6',
-    name: 'Sonnet 4.6',
-    desc: 'Best for everyday tasks',
-    baseValue: 'claude-sonnet-4-6',
-    thinkingValue: 'claude-sonnet-4-6-thinking'
-  },
-  {
-    id: 'haiku-4.5',
-    name: 'Haiku 4.5',
-    desc: 'Fastest for quick answers',
-    baseValue: 'claude-haiku-4-5-20251001',
-    thinkingValue: 'claude-haiku-4-5-20251001-thinking'
-  }
-];
-
-const MORE_MODELS: ModelDef[] = [
-  {
-    id: 'opus-4.5',
-    name: 'Opus 4.5',
-    desc: 'Previous generation Opus',
-    baseValue: 'claude-opus-4-5-20251101',
-    thinkingValue: 'claude-opus-4-5-20251101-thinking'
-  },
-  {
-    id: 'sonnet-4.5',
-    name: 'Sonnet 4.5',
-    desc: 'Previous generation Sonnet',
-    baseValue: 'claude-sonnet-4-5-20250929',
-    thinkingValue: 'claude-sonnet-4-5-20250929-thinking'
-  }
-];
-
-// Helper to parse a model string into our internal state
-export function parseModelString(modelStr: string) {
-  const allModels = [...MODELS, ...MORE_MODELS];
-  // Check exact matches first
-  const match = allModels.find(m => m.baseValue === modelStr || m.thinkingValue === modelStr);
-
-  if (match) {
-    return {
-      modelId: match.id,
-      isThinking: modelStr.endsWith('-thinking')
-    };
-  }
-
-  // Default to Opus 4.6 Thinking if unknown
-  return {
-    modelId: 'opus-4.6',
-    isThinking: true
-  };
+function stripThinking(modelStr: string) {
+  return (modelStr || '').replace(/-thinking$/, '');
 }
 
-// Helper to construct model string
-export function getModelString(modelId: string, isThinking: boolean) {
-  const allModels = [...MODELS, ...MORE_MODELS];
-  const m = allModels.find(x => x.id === modelId);
-  if (!m) return 'claude-opus-4-6-thinking'; // Fallback
-  return isThinking ? m.thinkingValue : m.baseValue;
+function withThinking(base: string, thinking: boolean) {
+  return thinking ? `${base}-thinking` : base;
+}
+
+function isThinking(modelStr: string) {
+  return typeof modelStr === 'string' && modelStr.endsWith('-thinking');
 }
 
 interface ModelSelectorProps {
   currentModelString: string;
+  models: SelectableModel[];
   onModelChange: (newModelString: string) => void;
-  isNewChat: boolean;
+  isNewChat?: boolean;
   dropdownPosition?: 'top' | 'bottom';
 }
 
-const ModelSelector: React.FC<ModelSelectorProps> = ({ currentModelString, onModelChange, isNewChat, dropdownPosition }) => {
+const ModelSelector: React.FC<ModelSelectorProps> = ({
+  currentModelString,
+  models,
+  onModelChange,
+  dropdownPosition,
+}) => {
   const [isOpen, setIsOpen] = useState(false);
-  const [showMore, setShowMore] = useState(false);
   const [dropUp, setDropUp] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
 
-  const { modelId, isThinking } = parseModelString(currentModelString);
-  const currentModelDef = [...MODELS, ...MORE_MODELS].find(m => m.id === modelId) || MODELS[0];
+  const currentBase = stripThinking(currentModelString);
+  const thinking = isThinking(currentModelString);
+  const currentModel = models.find(m => m && m.id === currentBase);
+  const currentLabel = currentModel ? currentModel.name : currentBase || 'Model';
 
   useEffect(() => {
     const handleClickOutside = (event: MouseEvent) => {
       if (containerRef.current && !containerRef.current.contains(event.target as Node)) {
         setIsOpen(false);
-        setShowMore(false);
       }
     };
     document.addEventListener('mousedown', handleClickOutside);
     return () => document.removeEventListener('mousedown', handleClickOutside);
   }, []);
 
-  // Auto-detect direction when opening
   const handleToggleOpen = () => {
     if (!isOpen && containerRef.current) {
       const rect = containerRef.current.getBoundingClientRect();
       const spaceBelow = window.innerHeight - rect.bottom;
-      setDropUp(dropdownPosition === 'top' ? true : (dropdownPosition === 'bottom' ? false : spaceBelow < 320));
+      setDropUp(dropdownPosition === 'top' ? true : (dropdownPosition === 'bottom' ? false : spaceBelow < 280));
     }
     setIsOpen(!isOpen);
   };
 
-  const handleSelectModel = (id: string) => {
-    onModelChange(getModelString(id, isThinking));
+  const handleSelectModel = (baseId: string, enabled: number) => {
+    if (!enabled) return;
+    onModelChange(withThinking(baseId, thinking));
     setIsOpen(false);
   };
 
   const handleToggleThinking = () => {
-    onModelChange(getModelString(modelId, !isThinking));
-    // Don't close dropdown on toggle, usually better UX
+    onModelChange(withThinking(currentBase, !thinking));
   };
-
-  const visibleModels = isNewChat ? MODELS : [currentModelDef];
-
-  if (showMore) {
-    // Show "More models" view
-    return (
-      <div className="relative inline-block text-right" ref={containerRef}>
-        <button
-          onClick={handleToggleOpen}
-          className="flex items-center gap-1.5 text-[15px] font-medium text-claude-text hover:bg-claude-hover px-3 py-2 rounded-md transition-colors"
-        >
-          <span>{currentModelDef.name}</span>
-          {isThinking && <span className="text-claude-textSecondary font-normal">Extended</span>}
-          <ChevronDown size={14} className="text-claude-textSecondary" />
-        </button>
-
-        {isOpen && (
-          <div className={`absolute ${dropUp ? 'bottom-full mb-2' : 'top-full mt-2'} right-0 w-[240px] bg-claude-input rounded-xl shadow-xl border border-claude-border z-50 overflow-hidden py-1 text-left`}>
-            <div className="px-3 py-2 flex items-center gap-2 text-sm text-claude-textSecondary cursor-pointer hover:bg-claude-hover" onClick={() => setShowMore(false)}>
-              <ChevronDown size={16} className="rotate-90" />
-              <span>Back</span>
-            </div>
-            <div className="h-[1px] bg-claude-border my-1" />
-            {MORE_MODELS.map(m => (
-              <div
-                key={m.id}
-                onClick={() => {
-                  handleSelectModel(m.id);
-                  setShowMore(false);
-                }}
-                className="px-3 py-2 hover:bg-claude-hover cursor-pointer flex items-start gap-2 text-left"
-              >
-                <div className="flex-1">
-                  <div className="text-[14px] font-medium text-claude-text">{m.name}</div>
-                  {m.desc && <div className="text-[12px] text-claude-textSecondary mt-0.5">{m.desc}</div>}
-                </div>
-                {modelId === m.id && <Check size={16} className="text-claude-text mt-0.5" />}
-              </div>
-            ))}
-          </div>
-        )}
-      </div>
-    )
-  }
 
   return (
     <div className="relative inline-block text-right" ref={containerRef}>
@@ -175,36 +77,48 @@ const ModelSelector: React.FC<ModelSelectorProps> = ({ currentModelString, onMod
         onClick={handleToggleOpen}
         className="flex items-center gap-1.5 text-[15px] font-medium text-claude-text hover:bg-claude-hover px-3 py-2 rounded-md transition-colors"
       >
-        <span>{currentModelDef.name}</span>
-        {isThinking && <span className="text-claude-textSecondary font-normal">Extended</span>}
+        <span>{currentLabel}</span>
+        {thinking && <span className="text-claude-textSecondary font-normal">Extended</span>}
         <ChevronDown size={14} className="text-claude-textSecondary" />
       </button>
 
       {isOpen && (
-        <div className={`absolute ${dropUp ? 'bottom-full mb-2' : 'top-full mt-2'} right-0 w-[240px] bg-claude-input rounded-xl shadow-xl border border-claude-border z-50 overflow-hidden py-1 text-left`}>
+        <div className={`absolute ${dropUp ? 'bottom-full mb-2' : 'top-full mt-2'} right-0 w-[260px] bg-claude-input rounded-xl shadow-xl border border-claude-border z-50 overflow-hidden py-1 text-left`}>
+          {(models || []).slice(0, 3).map(m => {
+            if (!m) return null;
+            const active = currentBase === m.id;
+            const disabled = Number(m.enabled) !== 1;
 
+            const n = (m.name || '').toLowerCase();
+            let desc = m.id;
+            if (n.includes('opus')) desc = 'Most capable for ambitious work';
+            else if (n.includes('sonnet')) desc = 'Most efficient for everyday tasks';
+            else if (n.includes('haiku')) desc = 'Fastest for quick answers';
 
-          {visibleModels.map(m => (
-            <div
-              key={m.id}
-              onClick={() => handleSelectModel(m.id)}
-              className="px-3 py-2 hover:bg-claude-hover cursor-pointer flex items-start gap-2 text-left"
-            >
-              <div className="flex-1">
-                <div className="text-[14px] font-medium text-claude-text">{m.name}</div>
-                <div className="text-[12px] text-claude-textSecondary mt-0.5">{m.desc}</div>
-              </div>
-              {modelId === m.id && <Check size={16} className="text-claude-text mt-0.5" />}
-            </div>
-          ))}
+            return (
+              <button
+                key={m.id || Math.random()}
+                onClick={() => handleSelectModel(m.id, m.enabled)}
+                disabled={disabled}
+                className={`w-full px-4 py-2 flex items-center justify-between text-left ${disabled ? 'opacity-45 cursor-not-allowed' : 'hover:bg-claude-hover cursor-pointer'}`}
+              >
+                <div className="flex-1">
+                  <div className="flex items-center justify-between">
+                    <div className="text-[14.5px] font-[450] text-[#E0E0E0]">{m.name}</div>
+                  </div>
+                  <div className="text-[13px] text-[#81807d] mt-0.5">{desc}{disabled ? ' · 断供' : ''}</div>
+                </div>
+                {active && <Check size={18} className="text-[#3b82f6] ml-2 shrink-0" />}
+              </button>
+            );
+          })}
 
-          <div className="h-[1px] bg-claude-border my-1" />
+          <div className="h-[1px] bg-[#3a3a38] my-1 mx-4" />
 
-          {/* Extended Thinking Toggle */}
-          <div className="px-3 py-2 flex items-center justify-between hover:bg-claude-hover text-left">
+          <div className="px-4 py-2 flex items-center justify-between hover:bg-claude-hover text-left select-none cursor-pointer">
             <div className="flex-1">
-              <div className="text-[14px] font-medium text-claude-text">Extended thinking</div>
-              <div className="text-[12px] text-claude-textSecondary mt-0.5">Think longer for complex tasks</div>
+              <div className="text-[14.5px] font-[450] text-[#E0E0E0]">Extended thinking</div>
+              <div className="text-[13px] text-[#81807d] mt-0.5">Think longer for complex tasks</div>
             </div>
 
             <button
@@ -212,23 +126,18 @@ const ModelSelector: React.FC<ModelSelectorProps> = ({ currentModelString, onMod
                 e.stopPropagation();
                 handleToggleThinking();
               }}
-              className={`w-10 h-6 rounded-full relative transition-colors duration-200 ${isThinking ? 'bg-[#3A6FE0]' : 'bg-claude-border'}`}
+              className={`w-10 h-6 rounded-full relative transition-colors duration-200 ${thinking ? 'bg-[#3A6FE0]' : 'bg-claude-border'}`}
             >
-              <div className={`absolute top-1 w-4 h-4 rounded-full bg-white shadow-sm transition-transform duration-200 ${isThinking ? 'left-5' : 'left-1'}`} />
+              <div className={`absolute top-1 w-4 h-4 rounded-full bg-white shadow-sm transition-transform duration-200 ${thinking ? 'left-5' : 'left-1'}`} />
             </button>
           </div>
 
-          <div className="h-[1px] bg-claude-border my-1" />
+          <div className="h-[1px] bg-[#3a3a38] my-1 mx-4" />
 
-          {/* More Models */}
-          <div
-            onClick={() => setShowMore(true)}
-            className="px-3 py-2 hover:bg-claude-hover cursor-pointer flex items-center justify-between text-claude-text text-left"
-          >
-            <span className="text-[14px] font-medium">More models</span>
-            <ChevronRight size={16} className="text-claude-textSecondary" />
+          <div className="px-4 py-2 flex items-center justify-between hover:bg-claude-hover text-left select-none cursor-pointer text-[#E0E0E0] mb-1">
+            <span className="text-[14.5px] font-[450]">More models</span>
+            <ChevronRight size={16} className="text-[#81807d]" />
           </div>
-
         </div>
       )}
     </div>
@@ -236,3 +145,4 @@ const ModelSelector: React.FC<ModelSelectorProps> = ({ currentModelString, onMod
 };
 
 export default ModelSelector;
+

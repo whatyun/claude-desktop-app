@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { login, register, sendCode, forgotPassword, resetPassword } from '../api';
+import { login, register, sendCode, forgotPassword, resetPassword, gatewayLogin } from '../api';
 
 type View = 'login' | 'register' | 'verify' | 'forgot' | 'reset';
 
@@ -35,15 +35,28 @@ const Auth = () => {
   const showStrength = (view === 'register' || view === 'reset') && password;
   const strength = showStrength ? getPasswordStrength(password) : null;
 
+  const isElectron = !!(window as any).electronAPI?.isElectron;
+
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(''); setLoading(true);
     try {
-      const data = await login(email, password);
-      if (data.token) {
-        localStorage.setItem('auth_token', data.token);
-        localStorage.setItem('user', JSON.stringify(data.user));
-        window.location.href = '/';
+      if (isElectron) {
+        // Electron app: login via US gateway, get API key for Claude Code SDK
+        const data = await gatewayLogin(email, password);
+        if (data.api_key) {
+          window.location.hash = '#/'; window.location.reload();
+        } else {
+          setError('登录成功但未获取到 API Key');
+        }
+      } else {
+        // Web: login via Chengdu backend
+        const data = await login(email, password);
+        if (data.token) {
+          localStorage.setItem('auth_token', data.token);
+          localStorage.setItem('user', JSON.stringify(data.user));
+          window.location.hash = '#/'; window.location.reload();
+        }
       }
     } catch (err: any) {
       setError(err.message || '登录失败');
@@ -84,7 +97,7 @@ const Auth = () => {
       if (data.token) {
         localStorage.setItem('auth_token', data.token);
         localStorage.setItem('user', JSON.stringify(data.user));
-        window.location.href = '/';
+        window.location.hash = '#/'; window.location.reload();
       }
     } catch (err: any) {
       setError(err.message || '注册失败');
@@ -167,13 +180,7 @@ const Auth = () => {
       <div className="w-full max-w-md p-8 bg-white rounded-2xl shadow-sm border border-[#E5E5E5]">
         <div className="text-center mb-8">
           <h1 className="text-3xl font-serif-claude text-[#222] mb-2">Claude</h1>
-          <p className="text-[#747474]">
-            {view === 'login' && '欢迎回来'}
-            {view === 'register' && '创建账号'}
-            {view === 'verify' && '输入验证码'}
-            {view === 'forgot' && '找回密码'}
-            {view === 'reset' && '重置密码'}
-          </p>
+          <p className="text-[#747474]">欢迎回来</p>
         </div>
 
         {error && <div className="mb-4 p-3 bg-red-50 text-red-600 text-sm rounded-lg">{error}</div>}
@@ -195,108 +202,9 @@ const Auth = () => {
             <button type="submit" disabled={loading} className={btnClass}>
               {loading ? '登录中...' : '登录'}
             </button>
-            <div className="flex justify-between text-sm">
-              <button type="button" onClick={() => switchView('forgot')} className="text-[#CC7C5E] hover:underline">
-                忘记密码？
-              </button>
-              <button type="button" onClick={() => switchView('register')} className="text-[#CC7C5E] hover:underline">
-                注册账号
-              </button>
-            </div>
           </form>
         )}
 
-        {/* 注册第一步 */}
-        {view === 'register' && (
-          <form onSubmit={handleRegisterStep1} className="space-y-4">
-            <div>
-              <label className="block text-sm font-medium text-[#393939] mb-1">昵称</label>
-              <input type="text" required value={nickname} onChange={(e) => setNickname(e.target.value)}
-                className={inputClass} placeholder="您的昵称" />
-            </div>
-            <div>
-              <label className="block text-sm font-medium text-[#393939] mb-1">邮箱</label>
-              <input type="email" required value={email} onChange={(e) => setEmail(e.target.value)}
-                className={inputClass} placeholder="name@example.com" />
-            </div>
-            {renderPasswordField()}
-            <button type="submit" disabled={loading} className={btnClass}>
-              {loading ? '发送中...' : '发送验证码'}
-            </button>
-            <div className="text-center text-sm">
-              <span className="text-[#747474]">已有账号？</span>
-              <button type="button" onClick={() => switchView('login')} className="text-[#CC7C5E] hover:underline ml-1">
-                登录
-              </button>
-            </div>
-          </form>
-        )}
-
-        {/* 注册第二步：输入验证码 */}
-        {view === 'verify' && (
-          <form onSubmit={handleRegisterStep2} className="space-y-4">
-            <p className="text-sm text-[#747474]">验证码已发送至 <span className="font-medium text-[#393939]">{email}</span></p>
-            <div>
-              <label className="block text-sm font-medium text-[#393939] mb-1">验证码</label>
-              <input type="text" required maxLength={6} value={code} onChange={(e) => setCode(e.target.value.replace(/\D/g, ''))}
-                className={inputClass + " text-center text-lg tracking-widest"} placeholder="000000" />
-            </div>
-            <button type="submit" disabled={loading || code.length !== 6} className={btnClass}>
-              {loading ? '注册中...' : '完成注册'}
-            </button>
-            <div className="text-center text-sm">
-              <button type="button" disabled={countdown > 0} onClick={handleSendCode}
-                className="text-[#CC7C5E] hover:underline disabled:text-gray-400 disabled:no-underline">
-                {countdown > 0 ? `重新发送 (${countdown}s)` : '重新发送验证码'}
-              </button>
-            </div>
-            <div className="text-center text-sm">
-              <button type="button" onClick={() => switchView('register')} className="text-[#747474] hover:underline">
-                返回上一步
-              </button>
-            </div>
-          </form>
-        )}
-
-        {/* 忘记密码 */}
-        {view === 'forgot' && (
-          <form onSubmit={handleForgotPassword} className="space-y-4">
-            <div>
-              <label className="block text-sm font-medium text-[#393939] mb-1">邮箱</label>
-              <input type="email" required value={email} onChange={(e) => setEmail(e.target.value)}
-                className={inputClass} placeholder="name@example.com" />
-            </div>
-            <button type="submit" disabled={loading} className={btnClass}>
-              {loading ? '发送中...' : '发送重置验证码'}
-            </button>
-            <div className="text-center text-sm">
-              <button type="button" onClick={() => switchView('login')} className="text-[#CC7C5E] hover:underline">
-                返回登录
-              </button>
-            </div>
-          </form>
-        )}
-
-        {/* 重置密码 */}
-        {view === 'reset' && (
-          <form onSubmit={handleResetPassword} className="space-y-4">
-            <p className="text-sm text-[#747474]">验证码已发送至 <span className="font-medium text-[#393939]">{email}</span></p>
-            <div>
-              <label className="block text-sm font-medium text-[#393939] mb-1">验证码</label>
-              <input type="text" required maxLength={6} value={code} onChange={(e) => setCode(e.target.value.replace(/\D/g, ''))}
-                className={inputClass + " text-center text-lg tracking-widest"} placeholder="000000" />
-            </div>
-            {renderPasswordField()}
-            <button type="submit" disabled={loading || code.length !== 6} className={btnClass}>
-              {loading ? '重置中...' : '重置密码'}
-            </button>
-            <div className="text-center text-sm">
-              <button type="button" onClick={() => switchView('login')} className="text-[#CC7C5E] hover:underline">
-                返回登录
-              </button>
-            </div>
-          </form>
-        )}
       </div>
     </div>
   );

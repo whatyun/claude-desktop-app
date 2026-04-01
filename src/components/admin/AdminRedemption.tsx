@@ -44,6 +44,8 @@ export default function AdminRedemption() {
   const [generatedCodes, setGeneratedCodes] = useState<string[]>([]);
   const [loading, setLoading] = useState(false);
   const [copyFeedback, setCopyFeedback] = useState(false);
+  const [quickLoadingPlanId, setQuickLoadingPlanId] = useState<number | null>(null);
+  const [quickCopiedPlanId, setQuickCopiedPlanId] = useState<number | null>(null);
   const limit = 20;
 
   const load = useCallback(async () => {
@@ -93,6 +95,39 @@ export default function AdminRedemption() {
     }
   };
 
+  const buildRedeemMessage = (code: string) => (
+    `您的兑换码：${code}\n` +
+    '请到https://clawparrot.com，用您的邮箱注册一个账号，注册完成后点击界面左下角用户区域，然后点击payment，在那里进行套餐的兑换哦~或者直接点击聊天输入栏的“购买套餐”也可跳转至套餐兑换界面！感谢您的支持~使用时遇到什么bug或者体验不好的地方请联系我，我一定会重视各位老板们的意见的！'
+  );
+
+  const handleQuickGenerateAndCopy = async (plan: any) => {
+    if (!plan?.id) return;
+    setError('');
+    setQuickLoadingPlanId(plan.id);
+    try {
+      const res = await generateRedemptionCodes({
+        plan_id: plan.id,
+        count: 1,
+        expires_days: genForm.expires_days,
+        note: genForm.note || '后台快捷生成并复制',
+      });
+      const code = Array.isArray(res?.codes) ? res.codes[0] : '';
+      if (!code) throw new Error('兑换码生成失败，请重试');
+      setGeneratedCodes([code]);
+      await load();
+      const copied = await copyToClipboard(buildRedeemMessage(code));
+      if (!copied) {
+        throw new Error(`兑换码 ${code} 已生成，但复制失败，请手动复制`);
+      }
+      setQuickCopiedPlanId(plan.id);
+      setTimeout(() => setQuickCopiedPlanId((prev) => (prev === plan.id ? null : prev)), 2000);
+    } catch (e: any) {
+      setError(e?.message || '生成失败，请重试');
+    } finally {
+      setQuickLoadingPlanId(null);
+    }
+  };
+
   const totalPages = Math.ceil(total / limit);
 
   return (
@@ -111,6 +146,29 @@ export default function AdminRedemption() {
       </div>
 
       {error && <div className="mb-4 p-3 bg-red-50 border border-red-200 rounded-lg text-sm text-red-600">{error} <button onClick={() => setError('')} className="ml-2 underline">关闭</button></div>}
+
+      {plans.length > 0 && (
+        <div className="mb-4 p-4 bg-white border border-gray-200 rounded-xl">
+          <div className="text-sm font-medium text-gray-800 mb-2">一键生成并复制兑换话术</div>
+          <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-2">
+            {plans.slice(0, 4).map((plan: any) => {
+              const isLoading = quickLoadingPlanId === plan.id;
+              const copied = quickCopiedPlanId === plan.id;
+              return (
+                <button
+                  key={`quick-${plan.id}`}
+                  onClick={() => handleQuickGenerateAndCopy(plan)}
+                  disabled={isLoading}
+                  className="px-3 py-2 text-sm rounded-lg border border-blue-200 text-blue-600 bg-blue-50 hover:bg-blue-100 disabled:opacity-60 disabled:cursor-not-allowed"
+                >
+                  {isLoading ? '生成中...' : copied ? '已复制到剪贴板' : `${plan.name}（一键生成）`}
+                </button>
+              );
+            })}
+          </div>
+          <div className="mt-2 text-xs text-gray-500">点击后自动生成 1 条兑换码，并复制完整发送文案。</div>
+        </div>
+      )}
 
       <div className="flex gap-3 mb-4">
         {(['unused', 'used', 'expired', 'disabled'] as const).map(s => (

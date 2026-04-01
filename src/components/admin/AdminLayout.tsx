@@ -1,13 +1,14 @@
 import React, { useEffect, useState } from 'react';
 import { useNavigate, useLocation, Outlet } from 'react-router-dom';
 import { getUserProfile } from '../../api';
-import { LayoutDashboard, Key, Users, ArrowLeft, Package, Ticket, Cpu } from 'lucide-react';
+import { LayoutDashboard, Key, Users, ArrowLeft, Package, Ticket, Cpu, Bell } from 'lucide-react';
 
 const NAV = [
   { path: '/admin', label: 'Dashboard', icon: LayoutDashboard },
   { path: '/admin/keys', label: '密钥池', icon: Key },
   { path: '/admin/models', label: '模型管理', icon: Cpu },
   { path: '/admin/users', label: '用户管理', icon: Users },
+  { path: '/admin/announcements', label: '公告管理', icon: Bell },
   { path: '/admin/plans', label: '套餐管理', icon: Package },
   { path: '/admin/redemption', label: '兑换码', icon: Ticket },
 ];

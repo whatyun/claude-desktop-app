@@ -2,6 +2,9 @@ import React, { useEffect, useRef } from 'react';
 
 // 核心数据 - 来自 claude logo.txt
 const CORE_RADIUS = 27.2;
+const ROOT_WIDTH_SCALE = 1.1;
+const TIP_WIDTH_SCALE = 1.3;
+
 const INITIAL_TENTACLES = [
   { id: 1, angle: -176.8, length: 82.0, baseW: 10.0, tipW: 11.2 },
   { id: 2, angle: -144.1, length: 83.6, baseW: 16.5, tipW: 19.1 },
@@ -15,7 +18,11 @@ const INITIAL_TENTACLES = [
   { id: 10, angle: 98.5,  length: 73.8, baseW: 9.8,  tipW: 15.7 },
   { id: 11, angle: 128.1, length: 77.6, baseW: 13.5, tipW: 11.8 },
   { id: 12, angle: 148.1, length: 75.0, baseW: 13.6, tipW: 14.4 }
-];
+].map((tentacle) => ({
+  ...tentacle,
+  baseW: tentacle.baseW * ROOT_WIDTH_SCALE,
+  tipW: tentacle.tipW * TIP_WIDTH_SCALE,
+}));
 
 interface ClaudeLogoProps {
   className?: string;
@@ -85,18 +92,16 @@ const ClaudeLogo: React.FC<ClaudeLogoProps> = ({ className = '', style, onClick,
     const handleResize = () => {
       const rect = container.getBoundingClientRect();
       const dpr = window.devicePixelRatio || 1;
+      const width = Math.max(1, Math.round(rect.width));
+      const height = Math.max(1, Math.round(rect.height));
       
-      canvas.width = rect.width * dpr;
-      canvas.height = rect.height * dpr;
+      canvas.width = Math.max(1, Math.round(width * dpr));
+      canvas.height = Math.max(1, Math.round(height * dpr));
       
       // 计算缩放比例
       // 参考尺寸: 240 (大约是 tentacles 展开后的直径)
-      // 恢复到较大的缩放比例，让图标填满容器
-      const minDim = Math.min(rect.width, rect.height);
-      // 防止除以0
-      if (minDim > 0) {
-        state.scale = (minDim / 240) * 0.85; 
-      }
+      const minDim = Math.min(width, height);
+      state.scale = (minDim / 240) * 0.85;
       
       ctx.setTransform(1, 0, 0, 1, 0, 0);
       ctx.scale(dpr, dpr);
@@ -269,6 +274,14 @@ const ClaudeLogo: React.FC<ClaudeLogoProps> = ({ className = '', style, onClick,
     };
 
     handleResize();
+    // 首帧后再测一次，避免字体/布局延迟导致的初始尺寸抖动
+    const resizeAfterPaint = requestAnimationFrame(handleResize);
+
+    const resizeObserver = typeof ResizeObserver !== 'undefined'
+      ? new ResizeObserver(() => handleResize())
+      : null;
+    resizeObserver?.observe(container);
+
     window.addEventListener('resize', handleResize);
     // 监听 window 上的鼠标移动，以支持更大范围的交互
     window.addEventListener('mousemove', handleMouseMove);
@@ -280,6 +293,8 @@ const ClaudeLogo: React.FC<ClaudeLogoProps> = ({ className = '', style, onClick,
       window.removeEventListener('resize', handleResize);
       window.removeEventListener('mousemove', handleMouseMove);
       window.removeEventListener('mouseleave', handleMouseLeave);
+      resizeObserver?.disconnect();
+      cancelAnimationFrame(resizeAfterPaint);
       if (requestRef.current) cancelAnimationFrame(requestRef.current);
     };
   }, []); // 依赖为空，使用 refs 管理可变状态

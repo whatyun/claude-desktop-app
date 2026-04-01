@@ -1,4 +1,7 @@
-const API_BASE = '/api';
+const API_BASE = 'http://127.0.0.1:30080/api';
+const GATEWAY_BASE = 'https://api-cn.jiazhuang.cloud';
+const CHENGDU_API = 'https://clawparrot.com/api';
+const isElectronApp = typeof window !== 'undefined' && !!(window as any).electronAPI?.isElectron;
 
 // 获取存储的 token
 function getToken() {
@@ -19,7 +22,7 @@ async function request(path: string, options: RequestInit = {}) {
   if (res.status === 401) {
     localStorage.removeItem('auth_token');
     localStorage.removeItem('user');
-    window.location.href = '/login';
+    window.location.hash = '#/login'; window.location.reload();
     throw new Error('认证失效');
   }
   if (!res.ok) {
@@ -54,6 +57,58 @@ export async function login(email: string, password: string) {
   return res.json();
 }
 
+// Gateway login for Electron app — authenticates via US gateway, returns API key for Claude Code SDK
+export async function gatewayLogin(email: string, password: string) {
+  const res = await fetch(`${GATEWAY_BASE}/gateway/auth/login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email, password }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.error || '登录失败');
+  }
+  const data = await res.json();
+  if (data.api_key) {
+    localStorage.setItem('ANTHROPIC_API_KEY', data.api_key);
+    localStorage.setItem('ANTHROPIC_BASE_URL', GATEWAY_BASE);
+    localStorage.setItem('gateway_user', JSON.stringify(data.user || {}));
+    localStorage.setItem('gateway_quota', JSON.stringify(data.quota || {}));
+    // Also store Chengdu JWT + user in standard keys so profile/usage APIs work
+    if (data.chengdu_token) {
+      localStorage.setItem('auth_token', data.chengdu_token);
+    }
+    if (data.user) {
+      localStorage.setItem('user', JSON.stringify(data.user));
+    }
+  }
+  return data;
+}
+
+// Check if user is logged in via gateway
+export function isGatewayLoggedIn(): boolean {
+  return !!(localStorage.getItem('ANTHROPIC_API_KEY') && localStorage.getItem('gateway_user'));
+}
+
+// Gateway logout
+export function gatewayLogout() {
+  localStorage.removeItem('ANTHROPIC_API_KEY');
+  localStorage.removeItem('ANTHROPIC_BASE_URL');
+  localStorage.removeItem('gateway_user');
+  localStorage.removeItem('gateway_quota');
+}
+
+// Get gateway usage status
+export async function getGatewayUsage() {
+  const key = localStorage.getItem('ANTHROPIC_API_KEY');
+  if (!key) return null;
+  const res = await fetch(`${GATEWAY_BASE}/gateway/usage`, {
+    headers: { 'x-api-key': key },
+  });
+  if (!res.ok) return null;
+  return res.json();
+}
+
 export async function forgotPassword(email: string) {
   const res = await request('/auth/forgot-password', {
     method: 'POST',
@@ -73,7 +128,12 @@ export async function resetPassword(email: string, code: string, password: strin
 export function logout() {
   localStorage.removeItem('auth_token');
   localStorage.removeItem('user');
-  window.location.href = '/login';
+  // Also clear gateway credentials (Electron app)
+  localStorage.removeItem('ANTHROPIC_API_KEY');
+  localStorage.removeItem('ANTHROPIC_BASE_URL');
+  localStorage.removeItem('gateway_user');
+  localStorage.removeItem('gateway_quota');
+  window.location.hash = '#/login'; window.location.reload();
 }
 
 export function getUser() {
@@ -81,23 +141,107 @@ export function getUser() {
   return userStr ? JSON.parse(userStr) : null;
 }
 
-// 用户资料
-export async function getUserProfile() {
-  const res = await request('/user/profile');
+// Helper: call Chengdu backend with stored JWT
+async function chengduRequest(path: string, options?: RequestInit) {
+  const token = localStorage.getItem('auth_token');
+  const headers: Record<string, string> = {};
+  if (token) headers['Authorization'] = `Bearer ${token}`;
+  if (options?.method && options.method !== 'GET') headers['Content-Type'] = 'application/json';
+  const url = `${CHENGDU_API}${path}`;
+  console.log('[chengduRequest]', url);
+  const res = await fetch(url, { ...options, headers: { ...headers, ...(options?.headers as Record<string, string> || {}) } });
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    console.error('[chengduRequest] Failed:', res.status, text.slice(0, 200));
+    throw new Error(`Chengdu ${path} failed: ${res.status}`);
+  }
   return res.json();
 }
 
+export async function getUserProfile() {
+  if (isElectronApp && localStorage.getItem('auth_token')) {
+    try {
+      const data = await chengduRequest('/user/profile');
+      // Update local cache
+      if (data.user || data) {
+        const user = data.user || data;
+        localStorage.setItem('user', JSON.stringify(user));
+      }
+      return data;
+    } catch (e) {
+      // Fallback to cached
+      const userStr = localStorage.getItem('user');
+      return { user: userStr ? JSON.parse(userStr) : {} };
+    }
+  }
+  const userStr = localStorage.getItem('user');
+  return { user: userStr ? JSON.parse(userStr) : {} };
+}
+
 export async function updateUserProfile(data: Record<string, any>) {
-  const res = await request('/user/profile', {
-    method: 'PATCH',
-    body: JSON.stringify(data),
+  if (isElectronApp && localStorage.getItem('auth_token')) {
+    const token = localStorage.getItem('auth_token');
+    const res = await fetch(`${CHENGDU_API}/user/profile`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+      body: JSON.stringify(data),
+    });
+    const result = await res.json();
+    const userStr = localStorage.getItem('user');
+    const user = userStr ? JSON.parse(userStr) : {};
+    localStorage.setItem('user', JSON.stringify({ ...user, ...result }));
+    return result;
+  }
+  const userStr = localStorage.getItem('user');
+  const user = userStr ? JSON.parse(userStr) : {};
+  const updated = { ...user, ...data };
+  localStorage.setItem('user', JSON.stringify(updated));
+  return updated;
+}
+
+export async function getUserUsage() {
+  if (isElectronApp && localStorage.getItem('auth_token')) {
+    try {
+      return await chengduRequest('/user/usage');
+    } catch (_) {}
+  }
+  return {
+    plan: {
+      id: 999,
+      name: 'Claude Code Unlimited',
+      status: 'active',
+      price: 0
+    },
+    token_quota: 99999999,
+    token_remaining: 99999999,
+    used: 0,
+    reset_date: '2099-12-31',
+    is_unlimited: true
+  };
+}
+
+export async function getUnreadAnnouncements() {
+  const res = await request('/user/announcements');
+  return res.json();
+}
+
+export async function markAnnouncementRead(id: number) {
+  const res = await request(`/user/announcements/${id}/read`, {
+    method: 'POST',
   });
   return res.json();
 }
 
-export async function getUserUsage() {
-  const res = await request('/user/usage');
-  return res.json();
+export async function getUserModels() {
+  if (isElectronApp && localStorage.getItem('auth_token')) {
+    try { return await chengduRequest('/user/models'); } catch (_) {}
+  }
+  try {
+    const res = await request('/user/models');
+    return res.json();
+  } catch (_) {
+    return { all: [] };
+  }
 }
 
 export async function getSessions() {
@@ -133,11 +277,23 @@ export async function deleteAccount(password: string) {
 
 // 套餐与支付
 export async function getPlans() {
+  if (isElectronApp && localStorage.getItem('auth_token')) {
+    try { return await chengduRequest('/payment/plans'); } catch (_) {}
+  }
   const res = await request('/payment/plans');
   return res.json();
 }
 
 export async function createPaymentOrder(planId: number, paymentMethod: string) {
+  if (isElectronApp && localStorage.getItem('auth_token')) {
+    const token = localStorage.getItem('auth_token');
+    const res = await fetch(`${CHENGDU_API}/payment/create`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+      body: JSON.stringify({ plan_id: planId, payment_method: paymentMethod }),
+    });
+    return res.json();
+  }
   const res = await request('/payment/create', {
     method: 'POST',
     body: JSON.stringify({ plan_id: planId, payment_method: paymentMethod }),
@@ -146,15 +302,114 @@ export async function createPaymentOrder(planId: number, paymentMethod: string) 
 }
 
 export async function getPaymentStatus(orderId: string) {
+  if (isElectronApp && localStorage.getItem('auth_token')) {
+    try { return await chengduRequest(`/payment/status/${orderId}`); } catch (_) {}
+  }
   const res = await request(`/payment/status/${orderId}`);
   return res.json();
 }
 
 // 兑换码
 export async function redeemCode(code: string) {
+  if (isElectronApp && localStorage.getItem('auth_token')) {
+    const token = localStorage.getItem('auth_token');
+    const res = await fetch(`${CHENGDU_API}/redemption/redeem`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+      body: JSON.stringify({ code }),
+    });
+    return res.json();
+  }
   const res = await request('/redemption/redeem', {
     method: 'POST',
     body: JSON.stringify({ code }),
+  });
+  return res.json();
+}
+
+// ═══ Projects ═══
+
+export interface Project {
+  id: string;
+  name: string;
+  description: string;
+  instructions: string;
+  workspace_path: string;
+  is_archived: number;
+  file_count?: number;
+  chat_count?: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ProjectFile {
+  id: string;
+  project_id: string;
+  file_name: string;
+  file_path: string;
+  file_size: number;
+  mime_type: string;
+  created_at: string;
+}
+
+export async function getProjects(): Promise<Project[]> {
+  const res = await request('/projects');
+  return res.json();
+}
+
+export async function createProject(name: string, description?: string): Promise<Project> {
+  const res = await request('/projects', {
+    method: 'POST',
+    body: JSON.stringify({ name, description: description || '' }),
+  });
+  return res.json();
+}
+
+export async function getProject(id: string) {
+  const res = await request(`/projects/${id}`);
+  return res.json();
+}
+
+export async function updateProject(id: string, data: Partial<Pick<Project, 'name' | 'description' | 'instructions' | 'is_archived'>>) {
+  const res = await request(`/projects/${id}`, {
+    method: 'PATCH',
+    body: JSON.stringify(data),
+  });
+  return res.json();
+}
+
+export async function deleteProject(id: string) {
+  const res = await request(`/projects/${id}`, { method: 'DELETE' });
+  return res.json();
+}
+
+export async function uploadProjectFile(projectId: string, file: File): Promise<ProjectFile> {
+  const formData = new FormData();
+  formData.append('file', file);
+  const token = getToken();
+  const res = await fetch(`${API_BASE}/projects/${projectId}/files`, {
+    method: 'POST',
+    headers: token ? { 'Authorization': `Bearer ${token}` } : {},
+    body: formData,
+  });
+  if (!res.ok) throw new Error('Upload failed');
+  return res.json();
+}
+
+export async function deleteProjectFile(projectId: string, fileId: string) {
+  const res = await request(`/projects/${projectId}/files/${fileId}`, { method: 'DELETE' });
+  return res.json();
+}
+
+export async function getProjectConversations(projectId: string) {
+  const res = await request(`/projects/${projectId}/conversations`);
+  return res.json();
+}
+
+export async function createProjectConversation(projectId: string, title?: string, model?: string) {
+  const res = await request(`/projects/${projectId}/conversations`, {
+    method: 'POST',
+    body: JSON.stringify({ title, model }),
   });
   return res.json();
 }
@@ -182,9 +437,95 @@ export async function getConversation(id: string) {
   return res.json();
 }
 
+export async function exportConversation(id: string): Promise<void> {
+  const token = getToken();
+
+  // Desktop (Electron) Logic
+  if (typeof window !== 'undefined' && (window as any).electronAPI) {
+    try {
+      const conv = await getConversation(id);
+
+      // Build a simple markdown snapshot
+      const lines = [`# ${conv.title || 'Conversation Snapshot'}\n`];
+      if (conv.messages && conv.messages.length > 0) {
+        conv.messages.forEach(m => {
+          lines.push(`## ${m.role === 'user' ? '用户 (User)' : '助手 (Assistant)'} - ${new Date(m.created_at).toLocaleString()}`);
+          lines.push(`${m.content}\n`);
+          if (m.toolCalls && m.toolCalls.length > 0) {
+            lines.push(`> [Tool Executions] ${m.toolCalls.map((tc: any) => tc.name).join(', ')}\n`);
+          }
+        });
+      }
+
+      const contextMarkdown = lines.join('\n');
+      const defaultFilename = `conversation-${id.slice(0, 8)}.zip`;
+
+      const result = await (window as any).electronAPI.exportWorkspace(id, contextMarkdown, defaultFilename);
+
+      if (result && !result.success && result.reason !== 'canceled') {
+        throw new Error("Local Export Failed");
+      }
+      return;
+    } catch (err: any) {
+      console.warn("Electron native export failed:", err);
+      throw new Error(err.message || "工作空间生成导致导出失败");
+    }
+  }
+
+  // Web Fallback Logic
+  const res = await fetch(`${API_BASE}/conversations/${id}/export`, {
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
+  });
+  if (res.status === 401) {
+    localStorage.removeItem('auth_token');
+    localStorage.removeItem('user');
+    window.location.hash = '#/login'; window.location.reload();
+    throw new Error('认证失效');
+  }
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error((err as any).error || '导出失败');
+  }
+  const blob = await res.blob();
+  const disposition = res.headers.get('content-disposition') || '';
+  const utf8Match = disposition.match(/filename\*=UTF-8''([^;]+)/i);
+  const plainMatch = disposition.match(/filename="?([^"]+)"?/i);
+  const filename = utf8Match
+    ? decodeURIComponent(utf8Match[1])
+    : (plainMatch ? plainMatch[1] : `conversation-${id.slice(0, 8)}.zip`);
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
 export async function deleteConversation(id: string) {
-  const res = await request(`/conversations/${id}`, { method: 'DELETE' });
-  return res.json();
+  // 先广播删除开始，通知前端中止该会话的流式输出，避免“串流到别的会话”
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('conversationDeleting', { detail: { id } }));
+  }
+
+  // 最佳努力：先请求后端停止生成（即使失败也不阻塞删除）
+  try {
+    await request(`/conversations/${id}/stop-generation`, { method: 'POST' });
+  } catch { }
+
+  try {
+    const res = await request(`/conversations/${id}`, { method: 'DELETE' });
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('conversationDeleted', { detail: { id } }));
+    }
+    return res.json();
+  } catch (err) {
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('conversationDeleteFailed', { detail: { id } }));
+    }
+    throw err;
+  }
 }
 
 export async function updateConversation(id: string, data: any) {
@@ -208,6 +549,12 @@ export async function stopGeneration(conversationId: string) {
   return res.json();
 }
 
+// 获取对话上下文大小
+export async function getContextSize(conversationId: string): Promise<{ tokens: number; limit: number }> {
+  const res = await request(`/conversations/${conversationId}/context-size`);
+  return res.json();
+}
+
 // 手动压缩对话
 export async function compactConversation(
   id: string,
@@ -221,9 +568,31 @@ export async function compactConversation(
 }
 
 // 删除指定消息及其后续消息
-export async function deleteMessagesFrom(conversationId: string, messageId: string) {
+export async function deleteMessagesFrom(
+  conversationId: string,
+  messageId: string,
+  preserveAttachmentIds?: string[]
+) {
   const res = await request(`/conversations/${conversationId}/messages/${messageId}`, {
     method: 'DELETE',
+    body: preserveAttachmentIds && preserveAttachmentIds.length > 0
+      ? JSON.stringify({ preserve_attachment_ids: preserveAttachmentIds })
+      : undefined,
+  });
+  return res.json();
+}
+
+// 删除对话末尾 N 条消息（编辑时 msg.id 不可用的回退方案）
+export async function deleteMessagesTail(
+  conversationId: string,
+  count: number,
+  preserveAttachmentIds?: string[]
+) {
+  const res = await request(`/conversations/${conversationId}/messages-tail/${count}`, {
+    method: 'DELETE',
+    body: preserveAttachmentIds && preserveAttachmentIds.length > 0
+      ? JSON.stringify({ preserve_attachment_ids: preserveAttachmentIds })
+      : undefined,
   });
   return res.json();
 }
@@ -239,7 +608,8 @@ export interface UploadResult {
 
 export function uploadFile(
   file: File,
-  onProgress?: (percent: number) => void
+  onProgress?: (percent: number) => void,
+  conversationId?: string
 ): Promise<UploadResult> {
   return new Promise((resolve, reject) => {
     const token = getToken();
@@ -257,20 +627,33 @@ export function uploadFile(
       if (xhr.status === 401) {
         localStorage.removeItem('auth_token');
         localStorage.removeItem('user');
-        window.location.href = '/login';
+        window.location.hash = '#/login'; window.location.reload();
         reject(new Error('认证失效'));
         return;
       }
-      try {
-        const data = JSON.parse(xhr.responseText);
-        if (xhr.status >= 200 && xhr.status < 300) {
-          resolve(data);
-        } else {
-          reject(new Error(data.error || '上传失败'));
+      const raw = xhr.responseText || '';
+      let data: any = null;
+      if (raw) {
+        try {
+          data = JSON.parse(raw);
+        } catch {
+          data = null;
         }
-      } catch {
-        reject(new Error('上传失败'));
       }
+
+      if (xhr.status >= 200 && xhr.status < 300) {
+        if (data) {
+          resolve(data);
+          return;
+        }
+        reject(new Error('上传失败：服务器返回异常'));
+        return;
+      }
+
+      const serverError = data?.error || data?.message;
+      const rawError = !data && raw ? raw.slice(0, 120) : '';
+      const detail = serverError || rawError || '上传失败';
+      reject(new Error(`${detail} (HTTP ${xhr.status})`));
     });
 
     xhr.addEventListener('error', () => reject(new Error('网络错误')));
@@ -279,6 +662,9 @@ export function uploadFile(
     xhr.open('POST', `${API_BASE}/upload`);
     if (token) {
       xhr.setRequestHeader('Authorization', `Bearer ${token}`);
+    }
+    if (conversationId) {
+      xhr.setRequestHeader('x-conversation-id', conversationId);
     }
     xhr.send(formData);
   });
@@ -292,6 +678,46 @@ export function getAttachmentUrl(fileId: string): string {
   return `${API_BASE}/uploads/${fileId}/raw`;
 }
 
+// Skills 相关
+export async function getSkills() {
+  const res = await request('/skills');
+  return res.json();
+}
+
+export async function getSkillDetail(id: string) {
+  const res = await request(`/skills/${id}`);
+  return res.json();
+}
+
+export async function createSkill(data: { name: string; description?: string; content?: string }) {
+  const res = await request('/skills', {
+    method: 'POST',
+    body: JSON.stringify(data),
+  });
+  return res.json();
+}
+
+export async function updateSkill(id: string, data: { name?: string; description?: string; content?: string }) {
+  const res = await request(`/skills/${id}`, {
+    method: 'PATCH',
+    body: JSON.stringify(data),
+  });
+  return res.json();
+}
+
+export async function deleteSkill(id: string) {
+  const res = await request(`/skills/${id}`, { method: 'DELETE' });
+  return res.json();
+}
+
+export async function toggleSkill(id: string, enabled: boolean) {
+  const res = await request(`/skills/${id}/toggle`, {
+    method: 'PATCH',
+    body: JSON.stringify({ enabled }),
+  });
+  return res.json();
+}
+
 // 流式对话（核心）
 export async function sendMessage(
   conversationId: string,
@@ -302,9 +728,11 @@ export async function sendMessage(
   onError: (err: string) => void,
   onThinking?: (thinking: string, full: string) => void,
   onSystem?: (event: string, message: string, data: any) => void,
-  onCitations?: (citations: Array<{ url: string; title: string; cited_text?: string }>, query?: string) => void,
+  onCitations?: (citations: Array<{ url: string; title: string; cited_text?: string }>, query?: string, tokens?: number) => void,
   onDocument?: (document: { id: string; title: string; filename: string; url: string; content?: string; format?: 'markdown' | 'docx' | 'pptx'; slides?: Array<{ title: string; content: string; notes?: string }> }) => void,
+  onDocumentDraft?: (draft: { draft_id: string; title?: string; format?: string; preview?: string; preview_available?: boolean; done?: boolean; document?: any }) => void,
   onCodeExecution?: (data: { type: string; executionId: string; code?: string; language?: string; files?: Array<{ id: string; name: string }>; stdout?: string; stderr?: string; images?: string[]; error?: string | null }) => void,
+  onToolUse?: (event: { type: 'start' | 'done'; tool_use_id: string; tool_name?: string; tool_input?: any; content?: string; is_error?: boolean }) => void,
   signal?: AbortSignal
 ) {
   const token = getToken();
@@ -320,6 +748,8 @@ export async function sendMessage(
         conversation_id: conversationId,
         message,
         attachments: attachments || undefined,
+        env_token: localStorage.getItem('CUSTOM_API_KEY') || localStorage.getItem('ANTHROPIC_API_KEY') || undefined,
+        env_base_url: localStorage.getItem('CUSTOM_BASE_URL') || localStorage.getItem('ANTHROPIC_BASE_URL') || undefined
       }),
       signal,
     });
@@ -336,6 +766,150 @@ export async function sendMessage(
     const decoder = new TextDecoder();
     let buffer = '';
     let thinkingText = '';
+    let pendingTextDelta = '';
+    let pendingThinkingDelta = '';
+    let flushScheduled = false;
+    const INLINE_ARTIFACT_OPEN = '<cp_artifact';
+    const INLINE_ARTIFACT_CLOSE = '</cp_artifact>';
+    let inlineArtifactBuffer = '';
+    let inlineArtifactSeq = 0;
+    let activeInlineArtifact: null | {
+      draft_id: string;
+      title: string;
+      format: string;
+      preview: string;
+    } = null;
+
+    const flushPending = () => {
+      flushScheduled = false;
+      if (pendingThinkingDelta && onThinking) {
+        const delta = pendingThinkingDelta;
+        pendingThinkingDelta = '';
+        onThinking(delta, thinkingText);
+      }
+      if (pendingTextDelta) {
+        const delta = pendingTextDelta;
+        pendingTextDelta = '';
+        onDelta(delta, fullText);
+      }
+    };
+
+    const scheduleFlush = () => {
+      if (flushScheduled) return;
+      flushScheduled = true;
+      if (typeof window !== 'undefined' && typeof window.requestAnimationFrame === 'function') {
+        window.requestAnimationFrame(() => flushPending());
+      } else {
+        setTimeout(flushPending, 16);
+      }
+    };
+
+    const appendVisibleText = (text: string) => {
+      if (!text) return;
+      fullText += text;
+      pendingTextDelta += text;
+      scheduleFlush();
+    };
+
+    const emitInlineArtifactDraft = (done = false) => {
+      if (!activeInlineArtifact || !onDocumentDraft) return;
+      onDocumentDraft({
+        draft_id: activeInlineArtifact.draft_id,
+        title: activeInlineArtifact.title,
+        format: activeInlineArtifact.format,
+        preview: activeInlineArtifact.preview,
+        preview_available: activeInlineArtifact.preview.length > 0,
+        done,
+      });
+    };
+
+    const appendInlineArtifactPreview = (text: string) => {
+      if (!text || !activeInlineArtifact) return;
+      activeInlineArtifact.preview += text;
+      emitInlineArtifactDraft(false);
+    };
+
+    const parseInlineArtifactAttrs = (tagText: string) => {
+      const titleMatch = tagText.match(/title="([^"]*)"/i);
+      const formatMatch = tagText.match(/format="([^"]*)"/i);
+      return {
+        title: (titleMatch?.[1] || '').trim() || 'Untitled document',
+        format: (formatMatch?.[1] || 'markdown').trim() || 'markdown',
+      };
+    };
+
+    const processInlineArtifactText = (chunk: string, flushAll = false) => {
+      if (!chunk && !flushAll) return;
+      inlineArtifactBuffer += chunk;
+
+      while (inlineArtifactBuffer) {
+        if (!activeInlineArtifact) {
+          const startIdx = inlineArtifactBuffer.indexOf(INLINE_ARTIFACT_OPEN);
+          if (startIdx === -1) {
+            if (flushAll) {
+              appendVisibleText(inlineArtifactBuffer);
+              inlineArtifactBuffer = '';
+            } else {
+              const keep = Math.min(inlineArtifactBuffer.length, INLINE_ARTIFACT_OPEN.length - 1);
+              const emit = inlineArtifactBuffer.slice(0, inlineArtifactBuffer.length - keep);
+              if (emit) appendVisibleText(emit);
+              inlineArtifactBuffer = inlineArtifactBuffer.slice(inlineArtifactBuffer.length - keep);
+            }
+            break;
+          }
+
+          if (startIdx > 0) {
+            appendVisibleText(inlineArtifactBuffer.slice(0, startIdx));
+            inlineArtifactBuffer = inlineArtifactBuffer.slice(startIdx);
+          }
+
+          const tagEndIdx = inlineArtifactBuffer.indexOf('>');
+          if (tagEndIdx === -1) {
+            if (flushAll) {
+              appendVisibleText(inlineArtifactBuffer);
+              inlineArtifactBuffer = '';
+            }
+            break;
+          }
+
+          const tagText = inlineArtifactBuffer.slice(0, tagEndIdx + 1);
+          const attrs = parseInlineArtifactAttrs(tagText);
+          inlineArtifactSeq += 1;
+          activeInlineArtifact = {
+            draft_id: `inline-artifact-${inlineArtifactSeq}`,
+            title: attrs.title,
+            format: attrs.format,
+            preview: '',
+          };
+          emitInlineArtifactDraft(false);
+          inlineArtifactBuffer = inlineArtifactBuffer.slice(tagEndIdx + 1);
+          continue;
+        }
+
+        const closeIdx = inlineArtifactBuffer.indexOf(INLINE_ARTIFACT_CLOSE);
+        if (closeIdx === -1) {
+          if (flushAll) {
+            appendInlineArtifactPreview(inlineArtifactBuffer);
+            inlineArtifactBuffer = '';
+            emitInlineArtifactDraft(true);
+            activeInlineArtifact = null;
+          } else {
+            const keep = Math.min(inlineArtifactBuffer.length, INLINE_ARTIFACT_CLOSE.length - 1);
+            const emit = inlineArtifactBuffer.slice(0, inlineArtifactBuffer.length - keep);
+            if (emit) appendInlineArtifactPreview(emit);
+            inlineArtifactBuffer = inlineArtifactBuffer.slice(inlineArtifactBuffer.length - keep);
+          }
+          break;
+        }
+
+        if (closeIdx > 0) {
+          appendInlineArtifactPreview(inlineArtifactBuffer.slice(0, closeIdx));
+        }
+        inlineArtifactBuffer = inlineArtifactBuffer.slice(closeIdx + INLINE_ARTIFACT_CLOSE.length);
+        emitInlineArtifactDraft(true);
+        activeInlineArtifact = null;
+      }
+    };
 
     while (true) {
       const { done, value } = await reader.read();
@@ -349,6 +923,8 @@ export async function sendMessage(
         if (!line.startsWith('data: ')) continue;
         const data = line.slice(6);
         if (data.trim() === '[DONE]') {
+          processInlineArtifactText('', true);
+          flushPending();
           onDone(fullText);
           return;
         }
@@ -382,7 +958,7 @@ export async function sendMessage(
           // 处理搜索来源事件
           if (parsed.type === 'search_sources') {
             if (onCitations && Array.isArray(parsed.sources)) {
-              onCitations(parsed.sources, parsed.query);
+              onCitations(parsed.sources, parsed.query, parsed.tokens);
             }
             continue;
           }
@@ -391,6 +967,21 @@ export async function sendMessage(
           if (parsed.type === 'document_created') {
             if (onDocument && parsed.document) {
               onDocument(parsed.document);
+            }
+            continue;
+          }
+
+          // 处理文档更新事件
+          if (parsed.type === 'document_updated') {
+            if (onDocument && parsed.document) {
+              onDocument(parsed.document);
+            }
+            continue;
+          }
+
+          if (parsed.type === 'document_draft') {
+            if (onDocumentDraft) {
+              onDocumentDraft(parsed);
             }
             continue;
           }
@@ -414,7 +1005,7 @@ export async function sendMessage(
           // 处理 thinking 内容
           if (parsed.type === 'content_block_delta' && parsed.delta) {
             if (parsed.delta.type === 'text_delta' && parsed.delta.text) {
-              let textChunk = parsed.delta.text;
+              const textChunk = parsed.delta.text;
               // 处理中转 API 将 <thinking> 标签嵌入 text 的情况
               if (textChunk.includes('<thinking>') || textChunk.includes('</thinking>')) {
                 const thinkRegex = /<thinking>([\s\S]*?)<\/thinking>/g;
@@ -423,23 +1014,23 @@ export async function sendMessage(
                 while ((match = thinkRegex.exec(textChunk)) !== null) {
                   if (onThinking) {
                     thinkingText += match[1];
-                    onThinking(match[1], thinkingText);
+                    pendingThinkingDelta += match[1];
+                    scheduleFlush();
                   }
                 }
                 cleaned = textChunk.replace(/<thinking>[\s\S]*?<\/thinking>\s*/g, '');
                 if (cleaned) {
-                  fullText += cleaned;
-                  onDelta(cleaned, fullText);
+                  processInlineArtifactText(cleaned);
                 }
               } else {
-                fullText += textChunk;
-                onDelta(textChunk, fullText);
+                processInlineArtifactText(textChunk);
               }
             }
             if (parsed.delta.type === 'thinking_delta' && parsed.delta.thinking) {
               thinkingText += parsed.delta.thinking;
               if (onThinking) {
-                onThinking(parsed.delta.thinking, thinkingText);
+                pendingThinkingDelta += parsed.delta.thinking;
+                scheduleFlush();
               }
             }
           }
@@ -452,9 +1043,19 @@ export async function sendMessage(
             }
           }
 
+          // Handle tool use events
+          if (parsed.type === 'tool_use_start' && onToolUse) {
+            onToolUse({ type: 'start', tool_use_id: parsed.tool_use_id, tool_name: parsed.tool_name, tool_input: parsed.tool_input });
+          }
+          if (parsed.type === 'tool_use_done' && onToolUse) {
+            onToolUse({ type: 'done', tool_use_id: parsed.tool_use_id, content: parsed.content, is_error: parsed.is_error });
+          }
+
           if (parsed.type === 'message_stop') {
+            processInlineArtifactText('', true);
             // 如果有文本内容才结束，否则可能是服务端工具中间的 message_stop
             if (fullText) {
+              flushPending();
               onDone(fullText);
               return;
             }
@@ -464,6 +1065,8 @@ export async function sendMessage(
 
           if (parsed.type === 'error') {
             const detail = parsed.detail ? `\n${parsed.detail}` : '';
+            processInlineArtifactText('', true);
+            flushPending();
             onError((parsed.error || '未知错误') + detail);
             return;
           }
@@ -473,18 +1076,38 @@ export async function sendMessage(
       }
     }
 
+    processInlineArtifactText('', true);
     if (fullText) {
+      flushPending();
       onDone(fullText);
     } else {
       // 无文本回复（如纯工具事件），也要触发完成回调
+      flushPending();
       onDone('');
     }
   } catch (err: any) {
     // 用户主动中断不算错误
     if (err.name === 'AbortError') {
+      // 主动中断时也先把已积累的内容刷到界面
       onDone(fullText);
       return;
     }
     onError(err.message || 'Network error');
   }
+}
+
+// Code API 相关
+export async function getCodeSSO() {
+  const res = await request('/code/sso');
+  return res.json();
+}
+
+export async function getCodeQuota() {
+  const res = await request('/code/quota');
+  return res.json();
+}
+
+export async function getCodePlans() {
+  const res = await request('/code/plans');
+  return res.json();
 }

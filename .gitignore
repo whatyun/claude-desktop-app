@@ -1,26 +1,41 @@
-# Logs
-logs
-*.log
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-pnpm-debug.log*
-lerna-debug.log*
+# Dependencies
+node_modules/
 
-node_modules
-dist
-dist-ssr
+# Build output
+dist/
+dist-ssr/
+release/
+
+# Installer artifacts
+*.exe
+*.blockmap
+latest.yml
+
+# Logs
+*.log
+frontend-error.log
+
+# Runtime data
+.api_history.json
+
+# Environment
+.env
+.env.local
 *.local
 
-# Editor directories and files
+# Editor
 .vscode/*
 !.vscode/extensions.json
 .idea
-.DS_Store
 *.suo
 *.ntvs*
 *.njsproj
 *.sln
 *.sw?
 
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude Code
 .claude/

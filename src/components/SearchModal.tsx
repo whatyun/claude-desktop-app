@@ -23,7 +23,7 @@ const getTimeLabel = (dateStr: string) => {
   yesterday.setDate(yesterday.getDate() - 1);
   const last7Days = new Date(today);
   last7Days.setDate(last7Days.getDate() - 7);
-  
+
   if (date >= today) return 'Today';
   if (date >= yesterday) return 'Yesterday';
   if (date >= last7Days) return 'Past week';
@@ -53,7 +53,7 @@ const SearchModal: React.FC<SearchModalProps> = ({ isOpen, onClose, chats }) => 
       return;
     }
     const lowerQuery = query.toLowerCase();
-    const filtered = chats.filter(chat => 
+    const filtered = chats.filter(chat =>
       (chat.title || 'Untitled conversation').toLowerCase().includes(lowerQuery)
     );
     setFilteredChats(filtered);
@@ -72,18 +72,18 @@ const SearchModal: React.FC<SearchModalProps> = ({ isOpen, onClose, chats }) => 
       <div className="absolute inset-0 bg-black/10 backdrop-blur-[1px] transition-opacity" />
 
       {/* Modal */}
-      <div 
+      <div
         className="relative w-full max-w-[600px] bg-[#F9F9F8] dark:bg-[#2D2D2A] rounded-xl shadow-2xl overflow-hidden flex flex-col max-h-[60vh] animate-in fade-in zoom-in-95 duration-200 border border-gray-200/50 dark:border-gray-700/50"
         onClick={e => e.stopPropagation()}
         style={{ boxShadow: '0 20px 25px -5px rgb(0 0 0 / 0.1), 0 8px 10px -6px rgb(0 0 0 / 0.1)' }}
       >
         {/* Search Input Area */}
         <div className="flex items-center gap-3 px-4 py-3 border-b border-gray-200/50 dark:border-gray-700/50 bg-white dark:bg-[#2D2D2A]">
-          <Search className="w-5 h-5 text-gray-400" strokeWidth={2} />
+          <Search className="w-5 h-5 text-gray-400 dark:text-claude-text/60" strokeWidth={2} />
           <input
             ref={inputRef}
             type="text"
-            className="flex-1 bg-transparent border-none outline-none text-[15px] text-gray-800 dark:text-gray-100 placeholder-gray-400 font-normal"
+            className="flex-1 bg-transparent border-none outline-none text-[15px] text-gray-800 dark:text-claude-text placeholder-gray-400 dark:placeholder-claude-text/60 font-normal"
             placeholder="Search chats and projects"
             value={query}
             onChange={e => setQuery(e.target.value)}
@@ -91,9 +91,9 @@ const SearchModal: React.FC<SearchModalProps> = ({ isOpen, onClose, chats }) => 
               if (e.key === 'Escape') onClose();
             }}
           />
-          <button 
+          <button
             onClick={onClose}
-            className="p-1 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-md transition-colors text-gray-400 hover:text-gray-600"
+            className="p-1 hover:bg-gray-100 dark:hover:bg-white/10 rounded-md transition-colors text-gray-400 dark:text-claude-text/60 hover:text-gray-600 dark:hover:text-claude-text"
           >
             <X className="w-5 h-5" />
           </button>
@@ -108,20 +108,20 @@ const SearchModal: React.FC<SearchModalProps> = ({ isOpen, onClose, chats }) => 
           ) : (
             <div className="px-2 space-y-0.5">
               {filteredChats.map(chat => (
-                <div 
+                <div
                   key={chat.id}
                   onClick={() => handleSelectChat(chat.id)}
                   className="flex items-center justify-between px-3 py-2.5 hover:bg-white dark:hover:bg-gray-700/50 hover:shadow-sm rounded-lg cursor-pointer group transition-all duration-200 border border-transparent hover:border-gray-100 dark:hover:border-gray-600/30"
                 >
                   <div className="flex items-center gap-3 min-w-0 flex-1 pr-4">
-                    <div className="w-5 h-5 flex items-center justify-center flex-shrink-0 text-gray-500">
+                    <div className="w-5 h-5 flex items-center justify-center flex-shrink-0 text-gray-500 dark:text-claude-text/60">
                       <MessageSquare className="w-4 h-4" strokeWidth={2} />
                     </div>
-                    <span className="text-[14px] text-gray-700 dark:text-gray-200 truncate font-normal leading-none pt-0.5">
+                    <span className="text-[14px] text-gray-700 dark:text-claude-text truncate font-normal leading-none pt-0.5">
                       {chat.title || 'Untitled conversation'}
                     </span>
                   </div>
-                  <span className="text-[12px] text-gray-400 flex-shrink-0 font-normal">
+                  <span className="text-[12px] text-gray-400 dark:text-claude-text/60 flex-shrink-0 font-normal">
                     {getTimeLabel(chat.updated_at || chat.created_at)}
                   </span>
                 </div>

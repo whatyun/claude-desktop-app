@@ -18,7 +18,7 @@ import searchIconImg from '../assets/icons/search-icon.png';
 import customizeIconImg from '../assets/icons/customize-icon.png';
 import { NAV_ITEMS } from '../constants';
 import { ChevronUp, Settings, HelpCircle, LogOut, Shield, CreditCard, Search } from 'lucide-react';
-import { getConversations, deleteConversation, updateConversation, getUser, getUserUsage, logout, getUserProfile } from '../api';
+import { getConversations, deleteConversation, updateConversation, getUser, getUserUsage, logout, getUserProfile, getCodeSSO } from '../api';
 
 import SearchModal from './SearchModal';
 
@@ -29,6 +29,7 @@ interface SidebarProps {
   onNewChatClick?: () => void;
   onOpenSettings?: () => void;
   onOpenUpgrade?: () => void;
+  onCloseOverlays?: () => void;
   tunerConfig?: any;
   setTunerConfig?: (config: any) => void;
 }
@@ -61,7 +62,7 @@ const RenameModal = ({ isOpen, onClose, onSave, initialTitle }: RenameModalProps
 
   return createPortal(
     <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/40" onClick={onClose}>
-      <div 
+      <div
         className="bg-claude-input rounded-2xl shadow-xl w-[400px] p-6 animate-fade-in"
         onClick={e => e.stopPropagation()}
       >
@@ -104,9 +105,10 @@ const RenameModal = ({ isOpen, onClose, onSave, initialTitle }: RenameModalProps
   );
 };
 
-const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, onOpenSettings, onOpenUpgrade, tunerConfig, setTunerConfig }: SidebarProps) => {
+const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, onOpenSettings, onOpenUpgrade, onCloseOverlays, tunerConfig, setTunerConfig }: SidebarProps) => {
   const navigate = useNavigate();
   const location = useLocation();
+  const codeJumpUrl = ((import.meta as any).env?.VITE_CODE_JUMP_URL || '/code/').trim();
   const [chats, setChats] = useState<any[]>([]);
   const [activeMenuIndex, setActiveMenuIndex] = useState<number | null>(null);
   const [menuPosition, setMenuPosition] = useState<{ top: number, left: number } | null>(null);
@@ -116,6 +118,7 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
   const [userUser, setUserUser] = useState<any>(null);
   const [showUserMenu, setShowUserMenu] = useState(false);
   const [showLogoutConfirm, setShowLogoutConfirm] = useState(false);
+  const [showHelpModal, setShowHelpModal] = useState(false);
   const [userMenuPos, setUserMenuPos] = useState<{ bottom: number; left: number } | null>(null);
   const [planLabel, setPlanLabel] = useState('Free plan');
   const [isAdmin, setIsAdmin] = useState(false);
@@ -153,11 +156,32 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
     }
   };
 
+  const handleNavClick = (label: string) => {
+    if (label === 'Chats') {
+      navigate('/chats');
+      return;
+    }
+    if (label === 'Projects') {
+      navigate('/projects');
+      return;
+    }
+    if (label === 'Code') {
+      // Disabled temporarily
+      return;
+    }
+  };
+
   useEffect(() => {
     setUserUser(getUser());
     fetchChats();
     fetchPlan();
-    getUserProfile().then((p: any) => { if (p.role === 'admin' || p.role === 'superadmin') setIsAdmin(true); }).catch(() => { });
+    getUserProfile().then((data: any) => {
+      const p = data?.user || data;
+      if (p?.role === 'admin' || p?.role === 'superadmin') setIsAdmin(true);
+      if (p?.nickname || p?.full_name) {
+        setUserUser((prev: any) => ({ ...prev, ...p }));
+      }
+    }).catch(() => { });
 
     // 监听标题更新事件
     const handleTitleUpdate = () => {
@@ -165,10 +189,24 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
       fetchChats();
     };
 
+    // 监听用户资料更新事件
+    const handleProfileUpdate = () => {
+      setUserUser(getUser());
+      getUserProfile().then((data: any) => {
+        const p = data?.user || data;
+        if (p?.role === 'admin' || p?.role === 'superadmin') setIsAdmin(true);
+        if (p?.nickname || p?.full_name) {
+          setUserUser((prev: any) => ({ ...prev, ...p }));
+        }
+      }).catch(() => { });
+    };
+
     window.addEventListener('conversationTitleUpdated', handleTitleUpdate);
+    window.addEventListener('userProfileUpdated', handleProfileUpdate);
 
     return () => {
       window.removeEventListener('conversationTitleUpdated', handleTitleUpdate);
+      window.removeEventListener('userProfileUpdated', handleProfileUpdate);
     };
   }, [refreshTrigger]);
 
@@ -220,15 +258,15 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
       // Optimistic update
       setChats(chats.map(c => c.id === renameChatId ? { ...c, title: newTitle } : c));
       await updateConversation(renameChatId, { title: newTitle });
-      
+
       // Notify other components (like Header) about the title change if it's the active chat
       if (location.pathname === `/chat/${renameChatId}`) {
-         window.dispatchEvent(new CustomEvent('conversationTitleUpdated'));
+        window.dispatchEvent(new CustomEvent('conversationTitleUpdated'));
       }
     } catch (err) {
       console.error('Failed to rename chat:', err);
       // Revert on failure
-      fetchChats(); 
+      fetchChats();
     }
     setShowRenameModal(false);
     setRenameChatId(null);
@@ -308,7 +346,7 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
 
     const menuHeight = 120; // Approximate height of the menu
     let topPos = buttonRect.bottom + 4;
-    
+
     // Check if menu would overflow bottom of viewport
     if (topPos + menuHeight > window.innerHeight) {
       // Position above the button instead
@@ -332,60 +370,12 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
           width: isCollapsed ? '46px' : `${tunerConfig?.sidebarWidth || 280}px`
         }}
       >
-        {/* Header */}
-        <div
-          className={`flex items-center justify-between flex-shrink-0`}
-          style={{
-            height: 'auto',
-            paddingLeft: '8px',
-            paddingRight: '8px',
-            paddingTop: `${tunerConfig?.headerPy || 6}px`,
-            paddingBottom: `${tunerConfig?.headerPy || 6}px`
-          }}
-        >
-          {/* Logo Container - Replaced Text with Image */}
-          <div className={`transition-all duration-200 ease-in-out ${isCollapsed ? 'w-0 opacity-0 overflow-hidden' : 'w-auto opacity-100'}`}>
-            <button onClick={() => navigate('/')} className="px-1 py-1 -ml-1 hover:bg-black/5 rounded-md transition-colors flex items-center">
-              <img
-                src={claudeImg}
-                alt="Claude"
-                style={{ height: '27px', width: 'auto' }}
-                className="object-contain dark:invert transition-[filter] duration-200"
-              />
-            </button>
-          </div>
-
-          {/* Toggle Button - Now Absolutely Positioned */}
-          <button
-            onClick={toggleSidebar}
-            className={`
-                text-claude-textSecondary hover:text-claude-text hover:bg-claude-hover rounded-lg transition-all duration-200 flex-shrink-0 absolute
-                ${isCollapsed
-                ? 'flex items-center justify-center p-1.5 rounded-md'
-                : 'p-1.5 rounded-md'
-              }
-              `}
-            style={{
-              top: `${tunerConfig?.toggleAbsTop}px`,
-              left: isCollapsed ? `${tunerConfig?.toggleAbsLeft || 9}px` : `calc(100% - ${(tunerConfig?.toggleAbsRight || 4) + (tunerConfig?.toggleSize || 27)}px)`,
-              width: `${tunerConfig?.toggleSize || 27}px`,
-              height: `${tunerConfig?.toggleSize || 27}px`,
-              padding: 0,
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-              transform: 'none',
-            }}
-          >
-            <IconSidebarToggle size={tunerConfig?.toggleSize} className="text-claude-textSecondary dark:invert transition-[filter] duration-200" />
-          </button>
-        </div>
 
         {/* New Chat - Fixed */}
         <div
           className="flex-shrink-0"
           style={{
-            marginTop: '8px',
+            marginTop: '58px',
             paddingLeft: '9px',
             paddingRight: '9px',
             marginBottom: '2px'
@@ -402,13 +392,13 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
             }}
           >
             <div className={`text-claude-text flex-shrink-0 flex items-center justify-center`}>
-              <IconPlusCircle 
-                size={27} 
+              <IconPlusCircle
+                size={27}
                 className={`transition-all duration-200 group-hover:brightness-90 ${isNewChatAnimating ? "rotate-90 scale-100" : "group-hover:scale-110 group-hover:-rotate-3"}`}
               />
             </div>
             <span
-              className={`font-medium leading-none mt-0.5 transition-opacity duration-200 text-left ${isCollapsed ? 'opacity-0 w-0 hidden' : 'opacity-100 block'}`}
+              className={`font-medium leading-none transition-opacity duration-200 text-left ${isCollapsed ? 'opacity-0 w-0 hidden' : 'opacity-100 block'}`}
               style={{ fontSize: '15px' }}
             >
               New chat
@@ -445,7 +435,7 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
               />
             </div>
             <span
-              className={`font-medium leading-none mt-0.5 transition-opacity duration-200 text-left ${isCollapsed ? 'opacity-0 w-0 hidden' : 'opacity-100 block'}`}
+              className={`font-medium leading-none transition-opacity duration-200 text-left ${isCollapsed ? 'opacity-0 w-0 hidden' : 'opacity-100 block'}`}
               style={{ fontSize: '15px' }}
             >
               Search
@@ -482,7 +472,7 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
               />
             </div>
             <span
-              className={`font-medium leading-none mt-0.5 transition-opacity duration-200 text-left ${isCollapsed ? 'opacity-0 w-0 hidden' : 'opacity-100 block'}`}
+              className={`font-medium leading-none transition-opacity duration-200 text-left ${isCollapsed ? 'opacity-0 w-0 hidden' : 'opacity-100 block'}`}
               style={{ fontSize: '15px' }}
             >
               Customize
@@ -506,13 +496,7 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
             {NAV_ITEMS.map((item) => (
               <button
                 key={item.label}
-                onClick={() => {
-                  if (item.label === 'Chats') {
-                    navigate('/chats');
-                  } else if (item.label === 'Projects') {
-                    navigate('/projects');
-                  }
-                }}
+                onClick={() => handleNavClick(item.label)}
                 className={`w-full flex items-center justify-start text-claude-text hover:bg-claude-hover rounded-lg transition-colors font-medium group overflow-hidden whitespace-nowrap ${(location.pathname === '/chats' && item.label === 'Chats') || (location.pathname === '/projects' && item.label === 'Projects') ? 'bg-claude-hover' : ''}`}
                 style={{
                   paddingTop: '2px',
@@ -525,7 +509,7 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
                   {getIcon(item.label, 27)}
                 </div>
                 <span
-                  className={`leading-none mt-0.5 transition-opacity duration-200 text-left ${isCollapsed ? 'opacity-0 w-0 hidden' : 'opacity-100 block'}`}
+                  className={`leading-none transition-opacity duration-200 text-left ${isCollapsed ? 'opacity-0 w-0 hidden' : 'opacity-100 block'}`}
                   style={{ fontSize: '15px' }}
                 >
                   {item.label}
@@ -537,14 +521,14 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
           {/* Recents Section Header */}
           <div
             className={`group flex items-center gap-3 px-3 pb-2 transition-opacity duration-200 select-none ${isCollapsed ? 'opacity-0 hidden' : 'opacity-100'}`}
-            style={{ 
+            style={{
               marginTop: `${tunerConfig?.recentsMt || 0}px`,
               paddingLeft: `${tunerConfig?.recentsPl || 12}px`,
               paddingRight: '12px'
             }}
           >
             <span className="text-[13px] font-medium text-claude-textSecondary">Recents</span>
-            <button 
+            <button
               onClick={(e) => {
                 e.stopPropagation();
                 setIsRecentsCollapsed(!isRecentsCollapsed);
@@ -562,7 +546,7 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
               return (
                 <div
                   key={chat.id}
-                  onClick={() => navigate(`/chat/${chat.id}`)}
+                  onClick={() => { onCloseOverlays?.(); navigate(`/chat/${chat.id}`); }}
                   className={`
                     relative group flex items-center w-full rounded-lg transition-colors cursor-pointer min-h-[32px]
                     ${isActive || activeMenuIndex === index ? 'bg-claude-hover' : 'hover:bg-claude-hover'}
@@ -622,26 +606,26 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
             }}
             className={`w-full flex items-center gap-2 hover:bg-claude-hover rounded-lg transition-all duration-200 overflow-hidden whitespace-nowrap`}
             style={{
-              padding: isCollapsed ? '8px 0px 8px 9px' : '8px'
+              padding: isCollapsed ? '8px 0px 8px 5px' : '8px'
             }}
           >
             <div
-              className="rounded-full bg-claude-avatar text-claude-avatarText flex items-center justify-center text-xs font-medium flex-shrink-0"
+              className="rounded-full bg-claude-avatar text-claude-avatarText flex items-center justify-center text-[15px] font-medium flex-shrink-0"
               style={{ width: `${tunerConfig?.userAvatarSize || 32}px`, height: `${tunerConfig?.userAvatarSize || 32}px` }}
             >
-              {userUser?.nickname?.charAt(0).toUpperCase() || 'U'}
+              {(userUser?.display_name || userUser?.full_name || userUser?.nickname || 'U').charAt(0).toUpperCase()}
             </div>
             <div className={`flex items-center justify-between w-full transition-opacity duration-200 ${isCollapsed ? 'opacity-0' : 'opacity-100'}`}>
               <div className="text-left overflow-hidden">
                 <div
-                  className="font-medium text-claude-text leading-none"
-                  style={{ fontSize: `${tunerConfig?.userNameSize || 15}px` }}
+                  className="font-medium text-claude-text leading-tight"
+                  style={{ fontSize: `${tunerConfig?.userNameSize || 15}px`, whiteSpace: 'nowrap', textOverflow: 'ellipsis', overflow: 'hidden' }}
                 >
-                  {userUser?.nickname || 'User'}
+                  {userUser?.display_name || userUser?.full_name || userUser?.nickname || 'User'}
                 </div>
-                <div className="text-[13px] text-claude-textSecondary mt-0.5 leading-none">{planLabel}</div>
+                <div className="text-[13px] text-claude-textSecondary mt-1 leading-tight">{planLabel}</div>
               </div>
-              <ChevronUp size={16} className="text-claude-textSecondary" />
+              <ChevronUp size={16} className="text-claude-textSecondary shrink-0 ml-1" />
             </div>
           </button>
 
@@ -652,7 +636,7 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
             >
               {/* User info header */}
               <div className="px-4 py-2.5 border-b border-claude-border">
-                <div className="text-[13px] font-medium text-claude-text">{userUser?.nickname || 'User'}</div>
+                <div className="text-[13px] font-medium text-claude-text">{userUser?.display_name || userUser?.full_name || userUser?.nickname || 'User'}</div>
                 <div className="text-[12px] text-claude-textSecondary mt-0.5">{userUser?.email || ''}</div>
               </div>
               {/* Menu items */}
@@ -669,7 +653,7 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
                   onClick={() => { setShowUserMenu(false); onOpenUpgrade?.(); }}
                 >
                   <CreditCard size={16} className="text-claude-textSecondary" />
-                  Billing
+                  Payment
                 </button>
                 {isAdmin && (
                   <button
@@ -681,10 +665,10 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
                   </button>
                 )}
                 <button
-                  className="w-full flex items-center gap-3 px-4 py-2 text-[13px] text-claude-textSecondary cursor-not-allowed"
-                  disabled
+                  onClick={() => { setShowUserMenu(false); setShowHelpModal(true); }}
+                  className="w-full flex items-center gap-3 px-4 py-2 text-[13px] text-claude-text hover:bg-claude-hover transition-colors"
                 >
-                  <HelpCircle size={16} className="text-[#BBB]" />
+                  <HelpCircle size={16} className="text-claude-textSecondary" />
                   Get Help
                 </button>
               </div>
@@ -718,7 +702,7 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
               <IconStarOutline size={16} className="text-claude-textSecondary group-hover:text-claude-text" />
               <span className="text-[13px] text-claude-text">Star</span>
             </button>
-            <button 
+            <button
               onClick={(e) => handleRenameClick(e, activeMenuIndex as number)}
               className="flex items-center gap-3 px-3 py-2 hover:bg-claude-hover text-left w-full transition-colors group"
             >
@@ -738,10 +722,10 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
       }
       {/* Fixed Layout Tuner (Removed) */}
 
-      <SearchModal 
-        isOpen={showSearch} 
-        onClose={() => setShowSearch(false)} 
-        chats={chats} 
+      <SearchModal
+        isOpen={showSearch}
+        onClose={() => setShowSearch(false)}
+        chats={chats}
       />
 
       {/* Rename Modal */}
@@ -774,6 +758,29 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
                 className="px-4 py-2 text-[13px] text-white bg-[#B9382C] hover:bg-[#A02E23] rounded-lg transition-colors"
               >
                 确认退出
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showHelpModal && (
+        <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/40" onClick={() => setShowHelpModal(false)}>
+          <div
+            className="bg-claude-input rounded-2xl shadow-xl w-[360px] p-6"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h3 className="text-[16px] font-semibold text-claude-text mb-2">售后支持</h3>
+            <p className="text-[14px] text-claude-textSecondary mb-3">售后 QQ 群号：</p>
+            <div className="px-4 py-3 mb-6 rounded-xl bg-claude-btn-hover text-[20px] font-semibold tracking-wide text-claude-text text-center select-all">
+              1083610043
+            </div>
+            <div className="flex justify-end">
+              <button
+                onClick={() => setShowHelpModal(false)}
+                className="px-4 py-2 text-[13px] text-claude-text bg-claude-btn-hover hover:bg-claude-hover rounded-lg transition-colors"
+              >
+                关闭
               </button>
             </div>
           </div>

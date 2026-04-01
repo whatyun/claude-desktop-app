@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { FileText, File, X, Code2, Download } from 'lucide-react';
+import { FileText, File, X, Code2, Download, FolderOpen } from 'lucide-react';
 import { getAttachmentUrl } from '../api';
 
 interface Attachment {
@@ -18,8 +18,11 @@ interface MessageAttachmentsProps {
   onOpenDocument?: (doc: DocumentInfo) => void;
 }
 
+const isElectron = !!(window as any).electronAPI?.isElectron;
+
 // 获取文件扩展名
-function getFileExtension(fileName: string): string {
+function getFileExtension(fileName: string | undefined | null): string {
+  if (!fileName) return '';
   const ext = fileName.split('.').pop()?.toLowerCase() || '';
   return ext.toUpperCase();
 }
@@ -36,17 +39,43 @@ function formatFileSize(bytes?: number): string {
   }
 }
 
+// Open the folder containing a file (Electron only), with deduplication
+async function openFileInFolder(fileId: string) {
+  if (!isElectron) return false;
+  try {
+    // Ask bridge server for the local path
+    const res = await fetch(`http://127.0.0.1:30080/api/uploads/${encodeURIComponent(fileId)}/path`);
+    if (!res.ok) return false;
+    const data = await res.json();
+    if (data.localPath) {
+      return await (window as any).electronAPI.showItemInFolder(data.localPath);
+    }
+    if (data.folder) {
+      return await (window as any).electronAPI.openFolder(data.folder);
+    }
+  } catch (err) {
+    console.error('[Attachment] Failed to open folder:', err);
+  }
+  return false;
+}
+
 const AttachmentCard: React.FC<{ attachment: Attachment; onClick: () => void }> = ({ attachment, onClick }) => {
+  if (!attachment || !attachment.id) return null;
   const [thumbnailUrl, setThumbnailUrl] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
-  const isImage = attachment.file_type === 'image' || attachment.mime_type.startsWith('image/');
+  const isImage = attachment.file_type === 'image' || (attachment.mime_type?.startsWith('image/') ?? false);
 
   useEffect(() => {
     if (isImage) {
-      const url = getAttachmentUrl(attachment.id);
-      const token = localStorage.getItem('auth_token');
-      setThumbnailUrl(`${url}${url.includes('?') ? '&' : '?'}token=${token}`);
+      if (isElectron) {
+        // In Electron, use bridge server to serve raw file
+        setThumbnailUrl(`http://127.0.0.1:30080/api/uploads/${encodeURIComponent(attachment.id)}/raw`);
+      } else {
+        const url = getAttachmentUrl(attachment.id);
+        const token = localStorage.getItem('auth_token');
+        setThumbnailUrl(`${url}${url.includes('?') ? '&' : '?'}token=${token}`);
+      }
       setLoading(false);
       return;
     }
@@ -54,30 +83,36 @@ const AttachmentCard: React.FC<{ attachment: Attachment; onClick: () => void }> 
     setLoading(false);
   }, [attachment.id, isImage]);
 
-  // 图片卡片保持不变
+  // 图片卡片
   if (isImage) {
     return (
-      <div 
+      <div
         className="relative w-28 h-28 rounded-xl overflow-hidden cursor-pointer border border-gray-200 hover:border-gray-300 dark:border-[#5B5B56] dark:hover:border-gray-400 group bg-white dark:bg-claude-input shadow-sm hover:opacity-90 transition-all"
         onClick={onClick}
       >
-        <img 
-          src={thumbnailUrl || ''} 
-          alt={attachment.file_name} 
+        <img
+          src={thumbnailUrl || ''}
+          alt={attachment.file_name}
           className="w-full h-full object-cover"
         />
+        {/* Folder icon overlay for Electron */}
+        {isElectron && (
+          <div className="absolute bottom-1 right-1 bg-black/40 rounded-md p-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
+            <FolderOpen size={12} className="text-white" />
+          </div>
+        )}
       </div>
     );
   }
 
-  // 新的文档卡片样式
-  const ext = getFileExtension(attachment.file_name);
+  // 文档卡片
+  const ext = getFileExtension(attachment.file_name || '');
 
   return (
-    <div 
+    <div
       className="relative w-28 h-28 rounded-xl cursor-pointer border border-gray-200 hover:border-gray-300 dark:border-[#5B5B56] dark:hover:border-gray-400 group overflow-hidden transition-all bg-white dark:bg-claude-input p-3 flex flex-col justify-between shadow-sm"
       onClick={onClick}
-      title={attachment.file_name}
+      title={`${attachment.file_name}${isElectron ? '\nClick to open in folder' : ''}`}
     >
       {loading ? (
         <div className="flex items-center justify-center h-full">
@@ -86,16 +121,21 @@ const AttachmentCard: React.FC<{ attachment: Attachment; onClick: () => void }> 
       ) : (
         <>
           <div className="min-w-0">
-            <div className="text-[13px] font-medium text-claude-text truncate" title={attachment.file_name}>
-              {attachment.file_name}
+            <div className="text-[13px] font-medium text-claude-text truncate" title={attachment.file_name || 'file'}>
+              {attachment.file_name || 'file'}
             </div>
             <div className="text-[11px] text-claude-textSecondary mt-0.5">
               {attachment.line_count ? `${attachment.line_count} lines` : (formatFileSize(attachment.file_size) || '文件')}
             </div>
           </div>
 
-          <div className="self-start px-1.5 py-0.5 text-[10px] font-medium border border-gray-200 dark:border-[#5B5B56] bg-gray-50 dark:bg-claude-input rounded text-claude-textSecondary uppercase">
-            {ext}
+          <div className="flex items-center justify-between">
+            <div className="px-1.5 py-0.5 text-[10px] font-medium border border-gray-200 dark:border-[#5B5B56] bg-gray-50 dark:bg-claude-input rounded text-claude-textSecondary uppercase">
+              {ext}
+            </div>
+            {isElectron && (
+              <FolderOpen size={12} className="text-claude-textSecondary opacity-0 group-hover:opacity-100 transition-opacity" />
+            )}
           </div>
         </>
       )}
@@ -109,23 +149,37 @@ const MessageAttachments: React.FC<MessageAttachmentsProps> = ({ attachments, on
   if (!attachments || attachments.length === 0) return null;
 
   const handleClick = async (att: Attachment) => {
+    // Electron mode: open file in system file explorer
+    if (isElectron) {
+      const opened = await openFileInFolder(att.id);
+      if (opened) return;
+      // If open failed (file not found), fall through to other handlers
+    }
+
     const url = getAttachmentUrl(att.id);
     const token = localStorage.getItem('auth_token');
-    
+
     // 图片：打开灯箱
-    if (att.file_type === 'image' || att.mime_type.startsWith('image/')) {
-      setLightboxUrl(`${url}${url.includes('?') ? '&' : '?'}token=${token}`);
+    if (att.file_type === 'image' || (att.mime_type?.startsWith('image/') ?? false)) {
+      if (isElectron) {
+        setLightboxUrl(`http://127.0.0.1:30080/api/uploads/${encodeURIComponent(att.id)}/raw`);
+      } else {
+        setLightboxUrl(`${url}${url.includes('?') ? '&' : '?'}token=${token}`);
+      }
       return;
     }
 
     // 代码/文本文件：尝试在右侧面板打开
     const textExtensions = ['SH', 'MD', 'PY', 'JS', 'TXT', 'HTML', 'CSS', 'JSON', 'XML', 'YAML', 'TS', 'TSX', 'JSX', 'JAVA', 'CPP', 'C', 'H', 'CS', 'GO', 'RS', 'RB', 'PHP', 'SQL', 'VUE', 'SVELTE', 'LUA'];
     const ext = getFileExtension(att.file_name);
-    
-    if (onOpenDocument && (textExtensions.includes(ext) || att.mime_type.startsWith('text/'))) {
+
+    if (onOpenDocument && (textExtensions.includes(ext) || (att.mime_type?.startsWith('text/') ?? false))) {
       try {
         // Fetch content
-        const res = await fetch(`${url}${url.includes('?') ? '&' : '?'}token=${token}`);
+        const fetchUrl = isElectron
+          ? `http://127.0.0.1:30080/api/uploads/${encodeURIComponent(att.id)}/raw`
+          : `${url}${url.includes('?') ? '&' : '?'}token=${token}`;
+        const res = await fetch(fetchUrl);
         if (res.ok) {
           const content = await res.text();
           onOpenDocument({
@@ -134,7 +188,7 @@ const MessageAttachments: React.FC<MessageAttachmentsProps> = ({ attachments, on
             filename: att.file_name,
             url: url,
             content: content,
-            format: 'markdown', // Use markdown renderer for code highlighting
+            format: 'markdown',
           });
           return;
         }
@@ -144,17 +198,19 @@ const MessageAttachments: React.FC<MessageAttachmentsProps> = ({ attachments, on
     }
 
     // 默认：下载文件
-    window.open(url, '_blank');
+    if (!isElectron) {
+      window.open(url, '_blank');
+    }
   };
 
   return (
     <>
       <div className="flex flex-wrap gap-2 mb-2">
-        {attachments.map((att) => (
-          <AttachmentCard 
-            key={att.id} 
-            attachment={att} 
-            onClick={() => handleClick(att)} 
+        {attachments.filter(att => att && att.id).map((att) => (
+          <AttachmentCard
+            key={att.id}
+            attachment={att}
+            onClick={() => handleClick(att)}
           />
         ))}
       </div>

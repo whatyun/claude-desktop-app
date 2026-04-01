@@ -66,13 +66,24 @@ const DocumentPanel: React.FC<DocumentPanelProps> = ({ document: doc, onClose })
       }
   };
 
+  const BINARY_FORMATS = ['pptx', 'docx', 'xlsx', 'pdf'];
+  const LANG_TO_EXT: Record<string, string> = {
+    markdown: 'md', python: 'py', javascript: 'js', typescript: 'ts',
+    java: 'java', c: 'c', cpp: 'cpp', csharp: 'cs',
+    go: 'go', rust: 'rs', ruby: 'rb', php: 'php',
+    swift: 'swift', kotlin: 'kt', scala: 'scala',
+    html: 'html', css: 'css', scss: 'scss',
+    sql: 'sql', shell: 'sh', bash: 'sh', powershell: 'ps1',
+    yaml: 'yml', json: 'json', xml: 'xml', toml: 'toml',
+    ini: 'ini', dockerfile: 'Dockerfile',
+    r: 'r', matlab: 'm', lua: 'lua', perl: 'pl',
+    dart: 'dart', vue: 'vue', svelte: 'svelte',
+  };
+
   const handleDownload = async (format?: string) => {
     setShowCopyMenu(false);
-    
+
     if (format === 'pdf' && fmt === 'markdown') {
-        // Simple PDF download for markdown (placeholder)
-        // In a real app, you'd use a library like html2pdf or jsPDF
-        // For now, we'll just download as markdown
         const blob = new Blob([doc.content || ''], { type: 'text/markdown;charset=utf-8' });
         const url = URL.createObjectURL(blob);
         const a = window.document.createElement('a');
@@ -83,12 +94,14 @@ const DocumentPanel: React.FC<DocumentPanelProps> = ({ document: doc, onClose })
         return;
     }
 
-    if (fmt === 'markdown') {
-      const blob = new Blob([doc.content || ''], { type: 'text/markdown;charset=utf-8' });
+    if (!BINARY_FORMATS.includes(fmt)) {
+      // Text-based: markdown or code files
+      const ext = LANG_TO_EXT[fmt] || fmt;
+      const blob = new Blob([doc.content || ''], { type: 'text/plain;charset=utf-8' });
       const url = URL.createObjectURL(blob);
       const a = window.document.createElement('a');
       a.href = url;
-      a.download = `${doc.title}.md`;
+      a.download = doc.title.includes('.') ? doc.title : `${doc.title}.${ext}`;
       a.click();
       URL.revokeObjectURL(url);
     } else {
@@ -133,14 +146,14 @@ const DocumentPanel: React.FC<DocumentPanelProps> = ({ document: doc, onClose })
             <div className="flex bg-claude-btnHover rounded-lg p-0.5 flex-shrink-0">
                 <button
                     onClick={() => setViewMode('preview')}
-                    className={`p-1.5 rounded-md transition-all ${viewMode === 'preview' ? 'bg-white shadow-sm text-claude-text' : 'text-claude-textSecondary hover:text-claude-text'}`}
+                    className={`p-1.5 rounded-md transition-all ${viewMode === 'preview' ? 'bg-white dark:bg-[#555] shadow-sm text-claude-text' : 'text-claude-textSecondary hover:text-claude-text'}`}
                     title="Preview"
                 >
                     <Eye size={16} />
                 </button>
                 <button
                     onClick={() => setViewMode('code')}
-                    className={`p-1.5 rounded-md transition-all ${viewMode === 'code' ? 'bg-white shadow-sm text-claude-text' : 'text-claude-textSecondary hover:text-claude-text'}`}
+                    className={`p-1.5 rounded-md transition-all ${viewMode === 'code' ? 'bg-white dark:bg-[#555] shadow-sm text-claude-text' : 'text-claude-textSecondary hover:text-claude-text'}`}
                     title="Code"
                 >
                     <Code size={16} />
@@ -219,17 +232,17 @@ const DocumentPanel: React.FC<DocumentPanelProps> = ({ document: doc, onClose })
       </div>
 
       {/* Content */}
-      <div className={`flex-1 overflow-y-auto chat-font-scope ${fmt === 'docx' || fmt === 'pdf' ? 'px-4 py-4 bg-claude-hover' : 'p-4'} ${viewMode === 'code' ? 'p-0 overflow-hidden' : ''}`}>
+      <div className={`flex-1 overflow-y-auto chat-font-scope ${fmt === 'docx' || fmt === 'pdf' ? 'px-6 py-6 bg-claude-hover' : 'px-8 py-6'} ${viewMode === 'code' || isCode ? '!p-0 overflow-hidden bg-[#FAFAFA] dark:bg-[#1E1E1E]' : ''}`}>
         {viewMode === 'code' || isCode ? (
-             <div className="flex h-full font-mono text-[13px] leading-relaxed relative">
+             <div className="flex h-full font-mono text-[13px] leading-relaxed relative bg-[#FAFAFA] dark:bg-[#1E1E1E]">
                  {/* Line Numbers */}
-                 <div ref={lineNumbersRef} className="flex-none w-[48px] bg-[#FAFAFA] dark:bg-[#1E1E1E] border-r border-claude-border text-right py-4 pr-3 select-none text-claude-textSecondary opacity-50 overflow-hidden h-full">
+                 <div ref={lineNumbersRef} className="flex-none w-[36px] bg-[#FAFAFA] dark:bg-[#1E1E1E] border-r border-claude-border text-right pt-4 pr-1.5 select-none text-claude-textSecondary opacity-50 overflow-hidden h-full">
                      {doc.content?.split('\n').map((_, i) => (
                          <div key={i} style={{ lineHeight: '1.625' }}>{i + 1}</div>
                      ))}
                  </div>
                  {/* Code Content */}
-                <div ref={contentRef} onScroll={handleScroll} className="flex-1 overflow-auto bg-white dark:bg-[#1E1E1E]">
+                <div ref={contentRef} onScroll={handleScroll} className="flex-1 overflow-auto bg-[#FAFAFA] dark:bg-[#1E1E1E]">
                     <SyntaxHighlighter
                         language={isCode ? fmt : 'markdown'}
                         style={isDark ? vscDarkPlus : oneLight}

@@ -1,5 +1,5 @@
 import React, { useEffect, useState, useCallback } from 'react';
-import { getKeys, addKey, updateKey, deleteKey, toggleKey, getPoolStatus, getRecharges, addRecharge, deleteRecharge } from '../../adminApi';
+import { getKeys, addKey, updateKey, deleteKey, toggleKey, getPoolStatus, getRecharges, addRecharge, deleteRecharge, getUpstreamRoutes, updateUpstreamRoutes } from '../../adminApi';
 import { Plus, Trash2, Power, RefreshCw, Edit2, X, Check, DollarSign, ChevronDown, ChevronUp } from 'lucide-react';
 
 interface ApiKey {
@@ -33,10 +33,28 @@ interface PoolItem {
   health_status: string;
 }
 
+type ModelGroup = 'opus' | 'sonnet' | 'haiku' | 'gpt';
+
+interface UpstreamRouteItem {
+  model_group: ModelGroup;
+  base_url: string;
+  preferred_key_id: number | null;
+  updated_at?: string | null;
+}
+
+type UpstreamRouteMap = Record<ModelGroup, UpstreamRouteItem>;
+
 const EMPTY_FORM = {
   api_key: '', base_url: '', relay_name: '', relay_url: '',
   max_concurrency: 3, priority: 0, weight: 1, note: '',
   input_rate: 0, output_rate: 0, group_multiplier: 1.0, charge_rate: 0,
+};
+
+const EMPTY_ROUTE_MAP: UpstreamRouteMap = {
+  opus: { model_group: 'opus', base_url: '', preferred_key_id: null },
+  sonnet: { model_group: 'sonnet', base_url: '', preferred_key_id: null },
+  haiku: { model_group: 'haiku', base_url: '', preferred_key_id: null },
+  gpt: { model_group: 'gpt', base_url: '', preferred_key_id: null },
 };
 
 function StatusDot({ status }: { status: string }) {
@@ -56,12 +74,22 @@ export default function AdminKeyPool() {
   const [rechargeForm, setRechargeForm] = useState({ amount_cny: '', key_ids: [] as number[], remark: '' });
   const [recharges, setRecharges] = useState<any[]>([]);
   const [showRechargeList, setShowRechargeList] = useState(false);
+  const [upstreamRoutes, setUpstreamRoutes] = useState<UpstreamRouteMap>(EMPTY_ROUTE_MAP);
+  const [savingRoutes, setSavingRoutes] = useState(false);
 
   const load = useCallback(async () => {
     try {
-      const [k, p] = await Promise.all([getKeys(), getPoolStatus()]);
+      const [k, p, routeResp] = await Promise.all([getKeys(), getPoolStatus(), getUpstreamRoutes()]);
       setKeys(k);
       setPool(p);
+      if (routeResp && routeResp.routes) {
+        setUpstreamRoutes({
+          opus: routeResp.routes.opus || EMPTY_ROUTE_MAP.opus,
+          sonnet: routeResp.routes.sonnet || EMPTY_ROUTE_MAP.sonnet,
+          haiku: routeResp.routes.haiku || EMPTY_ROUTE_MAP.haiku,
+          gpt: routeResp.routes.gpt || EMPTY_ROUTE_MAP.gpt,
+        });
+      }
     } catch (e: any) { setError(e.message); }
   }, []);
 
@@ -117,6 +145,33 @@ export default function AdminKeyPool() {
     return p ? p.current_concurrency : 0;
   };
 
+  const updateRoute = (group: ModelGroup, patch: Partial<UpstreamRouteItem>) => {
+    setUpstreamRoutes(prev => ({
+      ...prev,
+      [group]: { ...prev[group], ...patch, model_group: group },
+    }));
+  };
+
+  const handleRouteKeyChange = (group: ModelGroup, value: string) => {
+    const keyId = value ? Number(value) : null;
+    const key = keyId ? keys.find(k => k.id === keyId) : null;
+    updateRoute(group, {
+      preferred_key_id: keyId,
+      base_url: key ? key.base_url : upstreamRoutes[group].base_url,
+    });
+  };
+
+  const handleSaveRoutes = async () => {
+    setSavingRoutes(true);
+    try {
+      await updateUpstreamRoutes(upstreamRoutes);
+      await load();
+    } catch (e: any) {
+      setError(e.message);
+    }
+    setSavingRoutes(false);
+  };
+
   return (
     <div className="p-8">
       <div className="flex items-center justify-between mb-6">
@@ -137,6 +192,54 @@ export default function AdminKeyPool() {
       </div>
 
       {error && <div className="mb-4 p-3 bg-red-50 border border-red-200 rounded-lg text-sm text-red-600">{error} <button onClick={() => setError('')} className="ml-2 underline">关闭</button></div>}
+
+      <div className="mb-6 bg-white border border-gray-200 rounded-xl p-5">
+        <div className="flex items-center justify-between mb-3">
+          <h3 className="text-sm font-medium text-gray-700">模型上游路由</h3>
+          <button
+            onClick={handleSaveRoutes}
+            disabled={savingRoutes}
+            className="px-3 py-1.5 text-xs text-white bg-blue-500 rounded-lg hover:bg-blue-600 disabled:opacity-50"
+          >
+            {savingRoutes ? '保存中...' : '保存路由'}
+          </button>
+        </div>
+        <div className="text-xs text-gray-500 mb-3">
+          可按模型族指定上游地址和优先密钥。优先密钥不可用时，会回退到同一上游地址下的其他可用密钥。
+        </div>
+        <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-3">
+          {([
+            { group: 'sonnet', label: 'Sonnet' },
+            { group: 'haiku', label: 'Haiku' },
+            { group: 'opus', label: 'Opus' },
+            { group: 'gpt', label: 'GPT' },
+          ] as Array<{ group: ModelGroup; label: string }>).map(({ group, label }) => (
+            <div key={group} className="border border-gray-200 rounded-lg p-3">
+              <div className="text-xs font-medium text-gray-700 mb-2">{label}</div>
+              <input
+                value={upstreamRoutes[group]?.base_url || ''}
+                onChange={e => updateRoute(group, { base_url: e.target.value })}
+                placeholder="https://api.example.com"
+                className="w-full mb-2 px-2 py-1.5 border border-gray-200 rounded text-xs"
+              />
+              <select
+                value={upstreamRoutes[group]?.preferred_key_id ?? ''}
+                onChange={e => handleRouteKeyChange(group, e.target.value)}
+                className="w-full px-2 py-1.5 border border-gray-200 rounded text-xs"
+              >
+                <option value="">不指定（按权重）</option>
+                {keys
+                  .filter(k => !upstreamRoutes[group]?.base_url || k.base_url === upstreamRoutes[group]?.base_url)
+                  .map(k => (
+                    <option key={k.id} value={k.id}>
+                      #{k.id} {k.relay_name || k.note || k.api_key} {k.enabled ? '' : '(已禁用)'}
+                    </option>
+                  ))}
+              </select>
+            </div>
+          ))}
+        </div>
+      </div>
 
       {(showAdd || editId !== null) && (
         <div className="mb-6 bg-white border border-gray-200 rounded-xl p-5">

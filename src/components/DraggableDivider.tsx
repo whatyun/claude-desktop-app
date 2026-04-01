@@ -60,7 +60,7 @@ const DraggableDivider: React.FC<DraggableDividerProps> = ({ onResize, container
       }`} />
 
       {/* Handle Pill */}
-      <div className={`relative z-10 w-[4px] h-10 rounded-full shadow-sm transition-all duration-200 ${
+      <div className={`relative z-10 w-[6px] h-6 rounded-full shadow-sm transition-all duration-200 ${
         isDragging 
           ? 'bg-blue-500' 
           : 'bg-[#E5E5E5] dark:bg-[#404040] group-hover:bg-blue-400'
