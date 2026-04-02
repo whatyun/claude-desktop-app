@@ -27,6 +27,41 @@
       "node_modules/**/*"
     ],
     "asarUnpack": [],
+    "extraResources": [
+      {
+        "from": "engine/src",
+        "to": "engine/src",
+        "filter": ["**/*.ts", "**/*.tsx", "**/*.js", "**/*.json", "**/*.md", "**/*.txt"]
+      },
+      {
+        "from": "engine/bin",
+        "to": "engine/bin"
+      },
+      {
+        "from": "engine/preload.ts",
+        "to": "engine/preload.ts"
+      },
+      {
+        "from": "engine/bunfig.toml",
+        "to": "engine/bunfig.toml"
+      },
+      {
+        "from": "engine/package.json",
+        "to": "engine/package.json"
+      },
+      {
+        "from": "engine/tsconfig.json",
+        "to": "engine/tsconfig.json"
+      },
+      {
+        "from": "engine/stubs",
+        "to": "engine/stubs"
+      },
+      {
+        "from": "engine/node_modules",
+        "to": "engine/node_modules"
+      }
+    ],
     "publish": {
       "provider": "generic",
       "url": "https://update.jiazhuang.cloud"

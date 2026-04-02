@@ -892,10 +892,26 @@ You have the following skills available. When a user's request matches a skill's
 
     const { spawn } = require('child_process');
 
-    // Resolve engine path
-    const engineDir = path.join(__dirname, '..', 'engine');
+    // Resolve engine path — in packaged app, engine is in resources/engine
+    const isPacked = app.isPackaged;
+    const engineDir = isPacked
+        ? path.join(process.resourcesPath, 'engine')
+        : path.join(__dirname, '..', 'engine');
     const engineCli = path.join(engineDir, 'src', 'entrypoints', 'cli.tsx');
     const engineEnv = path.join(engineDir, '.env');
+
+    // Resolve Bun executable: bundled → user-installed → PATH
+    function findBunExe() {
+        const bundled = path.join(engineDir, 'bin', process.platform === 'win32' ? 'bun.exe' : 'bun');
+        if (fs.existsSync(bundled)) return bundled;
+        const userInstalled = process.platform === 'win32'
+            ? path.join(os.homedir(), '.bun', 'bin', 'bun.exe')
+            : path.join(os.homedir(), '.bun', 'bin', 'bun');
+        if (fs.existsSync(userInstalled)) return userInstalled;
+        return 'bun'; // fallback to PATH
+    }
+    const bunExePath = findBunExe();
+    console.log('[Engine] Bun:', bunExePath, 'exists:', fs.existsSync(bunExePath));
 
     // Load engine .env so bridge-server can use the same API config (for vision direct API calls)
     const engineEnvVars = {};
@@ -1147,7 +1163,7 @@ You have the following skills available. When a user's request matches a skill's
                 fs.writeFileSync(tmpFile, JSON.stringify({ endpoint, apiKey, body: apiBody }));
 
                 const visionHelper = path.join(engineDir, 'vision-helper.ts');
-                const bunExe = process.platform === 'win32' ? path.join(os.homedir(), '.bun', 'bin', 'bun.exe') : 'bun';
+                const bunExe = bunExePath;
 
                 console.log('[Chat] Vision request:', endpoint, 'body size:', fs.statSync(tmpFile).size, 'bytes');
                 const { spawn } = require('child_process');
@@ -1220,8 +1236,7 @@ You have the following skills available. When a user's request matches a skill's
             if (apiKey) envVars.ANTHROPIC_API_KEY = apiKey;
             if (baseUrl) envVars.ANTHROPIC_BASE_URL = baseUrl;
 
-            const bunExe = process.platform === 'win32'
-                ? path.join(os.homedir(), '.bun', 'bin', 'bun.exe') : 'bun';
+            const bunExe = bunExePath;
 
             console.log('[Engine] model=' + modelId + ' session=' + (conv.claude_session_id || 'new'));
             const { spawn } = require('child_process');
