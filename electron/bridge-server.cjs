@@ -2228,7 +2228,8 @@ You have the following skills available. When a user's request matches a skill's
     function spawnPersistentEngine(convId, conv, config) {
         const { modelId, apiKey, baseUrl, apiFormat, sysPrompt } = config;
         evictOldestEngine();
-        const cliArgs = ['--preload', enginePreload, '--env-file=' + engineEnv, engineCli, '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose', '--include-partial-messages', '--permission-mode', 'bypassPermissions', '--model', modelId];
+        const claudeDir = path.join(os.homedir(), '.claude');
+        const cliArgs = ['--preload', enginePreload, '--env-file=' + engineEnv, engineCli, '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose', '--include-partial-messages', '--permission-mode', 'bypassPermissions', '--add-dir', claudeDir, '--model', modelId];
         if (conv.claude_session_id) cliArgs.push('--resume', conv.claude_session_id);
         if (sysPrompt) cliArgs.push('--append-system-prompt', sysPrompt);
         const envVars = Object.assign({}, process.env);
@@ -2303,7 +2304,14 @@ You have the following skills available. When a user's request matches a skill's
         try {
             // /skill-name is passed as-is to the engine — the engine handles
             // slash commands internally (injects SKILL.md content into context).
-            // This is the most reliable approach across all models.
+            // Send a synthetic tool event so the frontend shows "Reading SKILL.md"
+            const skillInvokeMatch = message.match(/^\/([a-zA-Z0-9_-]+)(\s|$)/);
+            if (skillInvokeMatch) {
+                const skillSlug = skillInvokeMatch[1];
+                const fakeId = 'skill-invoke-' + Date.now();
+                sendSSE({ type: 'tool_use_start', tool_use_id: fakeId, tool_name: 'Skill', tool_input: { skill: skillSlug } });
+                sendSSE({ type: 'tool_use_done', tool_use_id: fakeId, content: `Reading ${skillSlug} SKILL.md`, is_error: false });
+            }
 
             // ── 1. Handle attachments: copy to workspace, append references to prompt ──
             let finalPrompt = message;
