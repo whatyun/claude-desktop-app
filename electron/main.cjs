@@ -135,9 +135,8 @@ app.whenReady().then(() => {
     // Auto-update (production only)
     if (!isDev) {
         autoUpdater.setFeedURL({
-            provider: 'github',
-            owner: 'pretend1111',
-            repo: 'claude-desktop-app',
+            provider: 'generic',
+            url: 'https://clawparrot.com/updates',
         });
         autoUpdater.autoDownload = true;
         autoUpdater.autoInstallOnAppQuit = true;
@@ -157,26 +156,36 @@ app.whenReady().then(() => {
         });
 
         autoUpdater.on('update-downloaded', (info) => {
-            console.log('[Update] Downloaded:', info.version, '— auto-restarting in 3s');
+            console.log('[Update] Downloaded:', info.version);
             if (mainWindow) {
                 mainWindow.webContents.send('update-status', { type: 'downloaded', version: info.version });
             }
-            // Auto-restart after 3 seconds to apply update
-            setTimeout(() => {
-                autoUpdater.quitAndInstall(false, true);
-            }, 3000);
+            // Don't auto-quit — let the user click "Relaunch" in the UI.
+            // On Mac, quitAndInstall's isForceRunAfter param is ignored,
+            // so we use app.relaunch() + app.exit() to ensure the app restarts.
         });
 
         autoUpdater.on('error', (err) => {
-            console.log('[Update] Error:', err.message);
+            console.error('[Update] Error:', err.message);
             if (mainWindow) {
                 mainWindow.webContents.send('update-status', { type: 'error', message: err.message });
             }
         });
 
-        // Check for updates after 5 seconds, then every 30 minutes
-        setTimeout(() => autoUpdater.checkForUpdates().catch(() => {}), 5000);
-        setInterval(() => autoUpdater.checkForUpdates().catch(() => {}), 30 * 60 * 1000);
+        autoUpdater.on('update-not-available', (info) => {
+            console.log('[Update] Already up-to-date:', info.version);
+        });
+
+        // Check for updates after 15 seconds (give network time to settle),
+        // then every 10 minutes (more frequent for users on unstable networks)
+        const doCheck = () => {
+            console.log('[Update] Checking for updates...');
+            autoUpdater.checkForUpdates().catch(err => {
+                console.error('[Update] Check failed:', err.message);
+            });
+        };
+        setTimeout(doCheck, 15000);
+        setInterval(doCheck, 10 * 60 * 1000);
     }
 
     app.on('activate', () => {
@@ -196,7 +205,16 @@ app.on('window-all-closed', () => {
 // IPC Handlers for future bridge communication
 ipcMain.handle('get-app-path', () => app.getPath('userData'));
 ipcMain.handle('get-platform', () => process.platform);
-ipcMain.handle('install-update', () => { autoUpdater.quitAndInstall(); });
+ipcMain.handle('install-update', () => {
+    // On Mac, autoUpdater.quitAndInstall() doesn't reliably relaunch the app.
+    // Use app.relaunch() + app.exit() to ensure the app restarts on all platforms.
+    if (process.platform === 'darwin') {
+        app.relaunch();
+        app.exit(0);
+    } else {
+        autoUpdater.quitAndInstall(false, true);
+    }
+});
 ipcMain.handle('open-external', (_, url) => { const { shell } = require('electron'); shell.openExternal(url); });
 ipcMain.handle('resize-window', (_, width, height) => {
     if (mainWindow) {
