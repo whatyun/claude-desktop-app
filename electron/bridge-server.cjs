@@ -127,13 +127,20 @@ function initServer(mainWindow) {
     // Resolve provider + key + url for a given model ID
     function resolveProvider(modelId) {
         // Search all enabled providers for this model
+        let match = null;
         for (const p of providers) {
             if (!p.enabled) continue;
             if (p.models && p.models.some(m => m.id === modelId && m.enabled !== false)) {
-                return p;
+                if (!match) {
+                    match = p;
+                } else {
+                    console.warn('[Provider] WARNING: model "' + modelId + '" exists in multiple providers: "' + match.name + '" AND "' + p.name + '". Using first match: "' + match.name + '" (' + match.baseUrl + ')');
+                }
             }
         }
-        return null;
+        if (match) console.log('[Provider] Resolved "' + modelId + '" → "' + match.name + '" (' + match.baseUrl + ')');
+        else console.log('[Provider] No provider found for "' + modelId + '"');
+        return match;
     }
 
     // ===== URL normalization helper =====
@@ -268,18 +275,12 @@ function initServer(mainWindow) {
                         // Convert Anthropic thinking config → OpenAI-compatible thinking params
                         // Qwen uses enable_thinking, DeepSeek uses similar pattern
                         if (anthropicReq.thinking && anthropicReq.thinking.type === 'enabled') {
-                            // Check if previous turn had a tool error — models like qwen sometimes
-                            // put tool content into thinking instead of tool args, causing failures.
-                            // When we detect this pattern, disable thinking so the retry succeeds.
-                            let hasRecentToolError = false;
-                            for (const m of (anthropicReq.messages || [])) {
-                                const parts = Array.isArray(m.content) ? m.content : [];
-                                if (parts.some(b => b.type === 'tool_result' && b.is_error)) {
-                                    hasRecentToolError = true;
-                                }
-                            }
-                            if (hasRecentToolError) {
-                                console.log('[Proxy] Tool error detected in history — disabling thinking for this request to avoid thinking+tools confusion');
+                            // Qwen (and similar models) have a known issue where thinking + tool_calls
+                            // don't work reliably together — the model puts tool arguments into
+                            // reasoning_content instead of function.arguments, causing empty tool inputs.
+                            // Only enable thinking when there are no tools in the request.
+                            if (openaiTools.length > 0) {
+                                console.log('[Proxy] Tools present — disabling thinking to avoid empty tool args (thinking+tools incompatibility)');
                             } else {
                                 openaiBody.enable_thinking = true;
                             }
@@ -322,8 +323,11 @@ function initServer(mainWindow) {
 
                         if (!upstreamRes.ok) {
                             const errText = await upstreamRes.text();
+                            // Include the upstream URL in error so users can see where the request went
+                            const errMsg = 'Failed to authenticate. API Error: ' + upstreamRes.status + ' ' + errText.slice(0, 400) + ' [endpoint: ' + endpoint + ']';
+                            console.error('[Proxy] Upstream error:', upstreamRes.status, 'from', endpoint, errText.slice(0, 200));
                             res.writeHead(upstreamRes.status, { 'Content-Type': 'application/json' });
-                            res.end(JSON.stringify({ type: 'error', error: { type: 'api_error', message: errText.slice(0, 500) } }));
+                            res.end(JSON.stringify({ type: 'error', error: { type: 'api_error', message: errMsg } }));
                             return;
                         }
 
@@ -426,9 +430,14 @@ function initServer(mainWindow) {
                                             textBlockStarted = false;
                                         }
                                         for (const [tcIdx, ptc] of pendingToolCalls) {
-                                            // Send input_json_delta with complete input
+                                            // Warn if tool args are empty — qwen sometimes generates tool_call
+                                            // name+id but fails to fill in function.arguments
                                             let parsedInput = {};
                                             try { parsedInput = JSON.parse(ptc.args); } catch (_) {}
+                                            if ((!ptc.args || Object.keys(parsedInput).length === 0) && ptc.name) {
+                                                console.warn('[Proxy] Tool call "' + ptc.name + '" has empty args — model may have failed to generate arguments');
+                                            }
+                                            // Send input_json_delta with complete input
                                             res.write('event: content_block_delta\ndata: ' + JSON.stringify({
                                                 type: 'content_block_delta', index: contentBlockIndex + tcIdx,
                                                 delta: { type: 'input_json_delta', partial_json: ptc.args }
@@ -1364,11 +1373,14 @@ function initServer(mainWindow) {
         Object.assign(p, req.body);
         delete p._id; // prevent duplication
         saveProviders();
+        // Kill all engines so they pick up new provider settings on next request
+        for (const [id] of enginePool) killEngine(id);
         res.json(p);
     });
     server.delete('/api/providers/:id', (req, res) => {
         providers = providers.filter(x => x.id !== req.params.id);
         saveProviders();
+        for (const [id] of enginePool) killEngine(id);
         res.json({ ok: true });
     });
     // Get all available models across all enabled providers
@@ -2212,6 +2224,7 @@ You have the following skills available. When a user's request matches a skill's
 
     function finishTurn(engine, convId, conv) {
         const turn = engine.turn; if (!turn) return;
+        if (turn.timeoutId) clearTimeout(turn.timeoutId);
         engine.turn = null; engine.state = 'idle';
         if (turn.assistantText || turn.thinkingText || turn.toolCalls.size > 0) {
             db.messages.push({ id: uuidv4(), conversation_id: convId, role: 'assistant', content: JSON.stringify([{ type: 'text', text: turn.assistantText }]), created_at: new Date().toISOString(), thinking: turn.thinkingText || undefined, toolCalls: turn.toolCalls.size > 0 ? turn.toolCallOrder.map(id => turn.toolCalls.get(id)).filter(Boolean) : undefined, toolTextEndOffset: (turn.toolCalls.size > 0 && turn.lastToolDoneTextLen > 0) ? turn.lastToolDoneTextLen : undefined, searchLogs: turn.searchLogs.length > 0 ? turn.searchLogs : undefined });
@@ -2389,7 +2402,19 @@ You have the following skills available. When a user's request matches a skill's
                 engine = spawnPersistentEngine(conversation_id, conv, { ...config, sysPrompt });
             }
             if (!isEngineAlive(engine)) throw new Error('Engine failed to start');
-            if (engine.state === 'processing') { await new Promise(r => setTimeout(r, 500)); if (engine.state === 'processing') throw new Error('Engine busy'); }
+            if (engine.state === 'processing') {
+                // Wait briefly in case the previous turn is about to finish
+                await new Promise(r => setTimeout(r, 1000));
+                if (engine.state === 'processing') {
+                    // Previous turn is stuck — kill the engine and spawn a fresh one
+                    console.warn('[Chat] Engine stuck in processing state for', conversation_id, '— killing and respawning');
+                    killEngine(conversation_id);
+                    engine = null;
+                    const sysPrompt = buildChatSystemPrompt(conv, user_mode, user_profile);
+                    engine = spawnPersistentEngine(conversation_id, conv, { ...config, sysPrompt });
+                    if (!isEngineAlive(engine)) throw new Error('Engine failed to restart');
+                }
+            }
 
             // ── 4. Start new turn ──
             engine.state = 'processing';
@@ -2410,8 +2435,21 @@ You have the following skills available. When a user's request matches a skill's
             // Write user message to stdin (stream-json format)
             engine.child.stdin.write(JSON.stringify({ type: 'user', message: { role: 'user', content: finalPrompt }, uuid: uuidv4() }) + '\n');
 
-            // Wait for turn to complete
-            await new Promise(resolve => { engine.turn.resolve = resolve; });
+            // Wait for turn to complete, with a 3-minute timeout.
+            // If the upstream API hangs (e.g. broken proxy), this prevents the engine
+            // from being stuck in 'processing' forever.
+            const TURN_TIMEOUT_MS = 3 * 60 * 1000;
+            await new Promise(resolve => {
+                engine.turn.resolve = resolve;
+                engine.turn.timeoutId = setTimeout(() => {
+                    if (engine.state === 'processing' && engine.turn) {
+                        console.error('[Chat] Turn timed out after ' + (TURN_TIMEOUT_MS / 1000) + 's for', conversation_id);
+                        engine.turn.sendSSE({ type: 'error', error: 'Request timed out — the API endpoint may be unresponsive. Please try again.' });
+                        finishTurn(engine, conversation_id, conv);
+                    }
+                }, TURN_TIMEOUT_MS);
+            });
+            if (engine.turn && engine.turn.timeoutId) clearTimeout(engine.turn.timeoutId);
         } catch (err) {
             pendingImageBlocks.delete(conversation_id);
             console.error('[Chat] Error:', (err.message || '').slice(0, 300));
