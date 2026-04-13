@@ -89,6 +89,11 @@ const API_BASE = 'http://127.0.0.1:30080/api';
 // Chat models: the subset of models shown in the conversation model selector
 interface ChatModel { id: string; name: string; providerId: string; providerName: string; thinkingId?: string; tier?: 'opus' | 'sonnet' | 'haiku' | 'extra'; }
 
+// Composite key that uniquely identifies a model across providers.
+// Two providers can expose the same model id (e.g. claude-opus-4-6);
+// uid = "providerId:modelId" prevents them from colliding in the UI.
+const modelUid = (m: { id: string; providerId: string }) => `${m.providerId}:${m.id}`;
+
 const TIER_DEFS: { key: 'opus' | 'sonnet' | 'haiku'; label: string; description: string }[] = [
   { key: 'opus', label: 'Opus 档', description: 'Most capable for ambitious work' },
   { key: 'sonnet', label: 'Sonnet 档', description: 'Most efficient for everyday tasks' },
@@ -119,7 +124,7 @@ const SearchableModelSelect = ({
 }: {
   value: string;
   onChange: (val: string) => void;
-  options: { id: string, name: string, providerName: string }[];
+  options: { id: string, providerId: string, name: string, providerName: string }[];
   placeholder: string;
   emptyLabel?: string;
   dashed?: boolean;
@@ -145,7 +150,8 @@ const SearchableModelSelect = ({
     o.providerName.toLowerCase().includes(search.toLowerCase())
   );
 
-  const selectedOption = options.find(o => o.id === value);
+  const optUid = (o: typeof options[0]) => `${o.providerId}:${o.id}`;
+  const selectedOption = options.find(o => optUid(o) === value);
 
   return (
     <div className="relative w-full" ref={ref}>
@@ -180,21 +186,25 @@ const SearchableModelSelect = ({
               </button>
             )}
             {filteredOptions.length === 0 && <div className="px-3 py-4 text-center text-[12px] text-claude-textSecondary">未找到匹配模型</div>}
-            {filteredOptions.map(o => (
+            {filteredOptions.map(o => {
+              const uid = optUid(o);
+              const selected = value === uid;
+              return (
               <button
-                key={o.id}
-                onClick={() => { onChange(o.id); setOpen(false); }}
-                className={`w-full text-left px-3 py-2 rounded-[6px] text-[13px] mb-0.5 transition-colors hover:bg-black/[0.04] dark:hover:bg-white/[0.04] flex flex-col gap-0.5 ${value === o.id ? 'bg-[#387ee0]/10 text-[#387ee0]' : 'text-claude-text'}`}
+                key={uid}
+                onClick={() => { onChange(uid); setOpen(false); }}
+                className={`w-full text-left px-3 py-2 rounded-[6px] text-[13px] mb-0.5 transition-colors hover:bg-black/[0.04] dark:hover:bg-white/[0.04] flex flex-col gap-0.5 ${selected ? 'bg-[#387ee0]/10 text-[#387ee0]' : 'text-claude-text'}`}
               >
                 <div className="flex items-center justify-between w-full">
-                  <span className={`font-semibold truncate pr-2 ${value === o.id ? 'text-[#387ee0]' : 'text-claude-text'}`}>{o.name}</span>
-                  {value === o.id && <Check size={14} className="flex-shrink-0 text-[#387ee0]" />}
+                  <span className={`font-semibold truncate pr-2 ${selected ? 'text-[#387ee0]' : 'text-claude-text'}`}>{o.name}</span>
+                  {selected && <Check size={14} className="flex-shrink-0 text-[#387ee0]" />}
                 </div>
-                <div className={`text-[11px] truncate ${value === o.id ? 'text-[#387ee0]/70' : 'text-claude-textSecondary/60'}`}>
+                <div className={`text-[11px] truncate ${selected ? 'text-[#387ee0]/70' : 'text-claude-textSecondary/60'}`}>
                   {o.providerName} &bull; <span className="font-mono">{o.id}</span>
                 </div>
               </button>
-            ))}
+              );
+            })}
           </div>
         </div>
       )}
@@ -377,11 +387,11 @@ const ProviderSettings: React.FC = () => {
     return undefined;
   };
 
-  const handleSetTierModel = (tier: 'opus' | 'sonnet' | 'haiku', modelId: string) => {
+  const handleSetTierModel = (tier: 'opus' | 'sonnet' | 'haiku', uid: string) => {
     // Remove any existing model in this tier
     let updated = chatModels.filter(cm => cm.tier !== tier);
-    if (modelId) {
-      const src = allAvailableModels.find(m => m.id === modelId);
+    if (uid) {
+      const src = allAvailableModels.find(m => modelUid(m) === uid);
       if (src) {
         const thinkingId = detectThinkingId(modelId);
         updated = [...updated, { ...src, tier, thinkingId }];
@@ -397,18 +407,19 @@ const ProviderSettings: React.FC = () => {
   };
 
   const handleAddExtraModel = (m: ChatModel) => {
-    if (chatModels.some(cm => cm.id === m.id)) return;
+    if (chatModels.some(cm => modelUid(cm) === modelUid(m))) return;
     const thinkingId = detectThinkingId(m.id);
     const updated = [...chatModels, { ...m, tier: 'extra' as const, thinkingId }];
     setChatModels(updated);
     saveChatModels(updated);
   };
 
-  const handleRemoveChatModel = (id: string) => {
-    const updated = chatModels.filter(cm => cm.id !== id);
+  const handleRemoveChatModel = (uid: string) => {
+    const removed = chatModels.find(cm => modelUid(cm) === uid);
+    const updated = chatModels.filter(cm => modelUid(cm) !== uid);
     setChatModels(updated);
     saveChatModels(updated);
-    if (defaultModel === id) {
+    if (removed && defaultModel === removed.id) {
       const newDefault = updated[0]?.id || '';
       setDefaultModel(newDefault);
       localStorage.setItem('default_model', newDefault);
@@ -433,8 +444,8 @@ const ProviderSettings: React.FC = () => {
             const assigned = chatModels.find(cm => cm.tier === tier.key);
             const assignedIsDefault = assigned && defaultModel === assigned.id;
             // Models available for this tier (not already assigned to another tier; ignore tierless entries)
-            const usedIds = new Set(chatModels.filter(cm => cm.tier && cm.tier !== tier.key).map(cm => cm.id));
-            const available = allAvailableModels.filter(m => !usedIds.has(m.id) && !m.id.endsWith('-thinking'));
+            const usedUids = new Set(chatModels.filter(cm => cm.tier && cm.tier !== tier.key).map(cm => modelUid(cm)));
+            const available = allAvailableModels.filter(m => !usedUids.has(modelUid(m)) && !m.id.endsWith('-thinking'));
             return (
               <div key={tier.key} className={`rounded-[12px] border transition-colors ${assigned ? (assignedIsDefault ? 'bg-[#387ee0]/5 border-[#387ee0]/40' : 'bg-black/[0.02] dark:bg-white/[0.02] border-claude-border') : 'border-dashed border-claude-border/40'}`}>
                 <div className="flex items-center gap-3 px-4 py-3">
@@ -453,9 +464,9 @@ const ProviderSettings: React.FC = () => {
                     <div className="flex items-center gap-2 mt-1.5">
                       <div className="flex-1 max-w-[320px]">
                         <SearchableModelSelect
-                          value={assigned?.id || ''}
-                          onChange={id => handleSetTierModel(tier.key, id)}
-                          options={[...(assigned && !available.find(x => x.id === assigned.id) ? [assigned] : []), ...available]}
+                          value={assigned ? modelUid(assigned) : ''}
+                          onChange={uid => handleSetTierModel(tier.key, uid)}
+                          options={[...(assigned && !available.find(x => modelUid(x) === modelUid(assigned)) ? [assigned] : []), ...available]}
                           placeholder="未分配"
                           emptyLabel="未分配"
                         />
@@ -474,8 +485,8 @@ const ProviderSettings: React.FC = () => {
         {/* More models section */}
         {(() => {
           const extraModels = chatModels.filter(cm => cm.tier === 'extra');
-          const usedIds = new Set(chatModels.map(cm => cm.id));
-          const availableForExtra = allAvailableModels.filter(m => !usedIds.has(m.id) && !m.id.endsWith('-thinking'));
+          const usedUids = new Set(chatModels.map(cm => modelUid(cm)));
+          const availableForExtra = allAvailableModels.filter(m => !usedUids.has(modelUid(m)) && !m.id.endsWith('-thinking'));
           return (
             <div>
               <div className="flex items-center justify-between mb-2">
@@ -484,7 +495,7 @@ const ProviderSettings: React.FC = () => {
               {extraModels.length > 0 && (
                 <div className="space-y-1.5 mb-3">
                   {extraModels.map(cm => (
-                    <div key={cm.id} className={`rounded-[10px] border transition-colors ${defaultModel === cm.id ? 'bg-[#387ee0]/5 border-[#387ee0]/40' : 'bg-black/[0.02] dark:bg-white/[0.02] border-claude-border/60 hover:bg-black/[0.04] dark:hover:bg-white/[0.04]'}`}>
+                    <div key={modelUid(cm)} className={`rounded-[10px] border transition-colors ${defaultModel === cm.id ? 'bg-[#387ee0]/5 border-[#387ee0]/40' : 'bg-black/[0.02] dark:bg-white/[0.02] border-claude-border/60 hover:bg-black/[0.04] dark:hover:bg-white/[0.04]'}`}>
                       <div className="flex items-center gap-2.5 px-3 py-2">
                         <button onClick={() => handleSetDefault(cm.id)} title={defaultModel === cm.id ? '当前默认' : '设为默认'}
                           className={`flex-shrink-0 transition-colors ${defaultModel === cm.id ? 'text-[#387ee0]' : 'text-claude-textSecondary/30 hover:text-[#387ee0]/80'}`}>
@@ -493,7 +504,7 @@ const ProviderSettings: React.FC = () => {
                         <div className="flex-1 min-w-0 flex items-center gap-1.5">
                           <input type="text" value={cm.name}
                             onChange={e => {
-                              const updated = chatModels.map(c => c.id === cm.id ? { ...c, name: e.target.value } : c);
+                              const updated = chatModels.map(c => modelUid(c) === modelUid(cm) ? { ...c, name: e.target.value } : c);
                               setChatModels(updated);
                               saveChatModels(updated);
                             }}
@@ -504,7 +515,7 @@ const ProviderSettings: React.FC = () => {
                         {cm.thinkingId && (
                           <span className="text-[9px] px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-600 dark:text-amber-400 flex-shrink-0">Thinking</span>
                         )}
-                        <button onClick={() => handleRemoveChatModel(cm.id)} className="p-0.5 text-claude-textSecondary/20 hover:text-red-400 transition-colors">
+                        <button onClick={() => handleRemoveChatModel(modelUid(cm))} className="p-0.5 text-claude-textSecondary/20 hover:text-red-400 transition-colors">
                           <X size={12} />
                         </button>
                       </div>
@@ -516,8 +527,8 @@ const ProviderSettings: React.FC = () => {
                 <div>
                   <SearchableModelSelect
                     value=""
-                    onChange={id => {
-                      const m = allAvailableModels.find(x => x.id === id);
+                    onChange={uid => {
+                      const m = allAvailableModels.find(x => modelUid(x) === uid);
                       if (m) handleAddExtraModel(m);
                     }}
                     options={availableForExtra}

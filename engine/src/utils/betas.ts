@@ -335,12 +335,14 @@ export const getAllModelBetas = memoize((model: string): string[] => {
     betaHeaders.push(TOKEN_EFFICIENT_TOOLS_BETA_HEADER)
   }
 
-  // Add web search beta for Vertex Claude 4.0+ models only
-  if (provider === 'vertex' && vertexModelSupportsWebSearch(model)) {
+  // Add web search beta header. Required for the server-side
+  // web_search_20250305 tool to be accepted by the API.
+  // firstParty: 3P providers that look like firstParty (ANTHROPIC_BASE_URL
+  // pointing to an aggregator) also need this header.
+  if (provider === 'firstParty' || provider === 'foundry') {
     betaHeaders.push(WEB_SEARCH_BETA_HEADER)
   }
-  // Foundry only ships models that already support Web Search
-  if (provider === 'foundry') {
+  if (provider === 'vertex' && vertexModelSupportsWebSearch(model)) {
     betaHeaders.push(WEB_SEARCH_BETA_HEADER)
   }
 

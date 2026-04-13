@@ -121,6 +121,18 @@ function createWindow() {
 }
 
 app.whenReady().then(() => {
+    // macOS: clear quarantine flags on bundled bun binary. Downloaded .dmg/.zip
+    // files get Apple's com.apple.quarantine xattr, and since our bun binary is
+    // unsigned, Gatekeeper silently blocks execution — the engine subprocess just
+    // exits immediately with no output. This one-liner strips the flag so bun can
+    // run. Safe to call every launch (no-op if already cleared or on non-Mac).
+    if (process.platform === 'darwin') {
+        try {
+            const engineBin = path.join(app.isPackaged ? process.resourcesPath : path.join(__dirname, '..'), 'engine', 'bin');
+            require('child_process').execSync(`xattr -cr "${engineBin}" 2>/dev/null || true`, { stdio: 'ignore' });
+        } catch (_) {}
+    }
+
     // Start Bridge Server
     const server = initServer();
     server.listen(30080, '127.0.0.1', () => {

@@ -1830,6 +1830,15 @@ function initServer(mainWindow) {
             });
             saveDb();
 
+            // Session JSONL was rewritten by the compact process — the pooled
+            // engine still has the old (pre-compact) messages in memory, so it
+            // must be killed so the next chat spawns a fresh engine that loads
+            // the compacted session.
+            const existingEngine = enginePool.get(req.params.id);
+            if (existingEngine) {
+                killEngine(req.params.id, 'manual_compact_session_changed');
+            }
+
             console.log(`[Compact] Done: ${messagesBeforeCompact} messages compacted, ~${tokensSaved} tokens saved`);
             res.json({ summary: compactSummary || 'Conversation compacted.', tokensSaved, messagesCompacted: messagesBeforeCompact });
         } catch (err) {
@@ -2056,14 +2065,16 @@ function initServer(mainWindow) {
     // used by the canonical Anthropic API). The probe issues a single /v1/messages call containing
     // web_search_20250305 as a server tool. A response containing server_tool_use + at least one
     // URL in web_search_tool_result counts as success.
-    function doAnthropicHttpProbe(p, authStyle) {
+    function doAnthropicHttpProbe(p, authStyle, overrideModel) {
         return new Promise((resolve) => {
             const https = require('https');
             const { URL } = require('url');
             const baseUrl = normalizeBaseUrl(p.baseUrl || '');
             let parsed;
             try { parsed = new URL(baseUrl); } catch (e) { return resolve({ ok: false, reason: 'Invalid baseUrl: ' + e.message }); }
-            const rawModel = (p.models || []).find(m => m.enabled !== false)?.id || (p.models || [])[0]?.id;
+            const rawModel = overrideModel
+                || (p.models || []).find(m => m.enabled !== false)?.id
+                || (p.models || [])[0]?.id;
             if (!rawModel) return resolve({ ok: false, reason: '无可用模型' });
             const modelId = rawModel.replace(/-thinking$/, '');
 
@@ -2135,25 +2146,53 @@ function initServer(mainWindow) {
 
     async function probeAnthropicWebSearch(p) {
         if (!p.baseUrl || !p.apiKey) return { ok: false, strategy: null, reason: 'Missing baseUrl or apiKey' };
+
+        // Sort models: prefer opus > sonnet > haiku (more capable models are
+        // more likely to exist on aggregator providers, and cost is negligible
+        // for a single probe request).
+        const modelRank = (id) => {
+            if (/opus/i.test(id)) return 0;
+            if (/sonnet/i.test(id)) return 1;
+            if (/haiku/i.test(id)) return 2;
+            return 3;
+        };
+        const enabledModels = (p.models || [])
+            .filter(m => m.enabled !== false && m.id)
+            .sort((a, b) => modelRank(a.id) - modelRank(b.id));
+        const modelIds = enabledModels.length > 0
+            ? enabledModels.map(m => m.id)
+            : [(p.models || [])[0]?.id].filter(Boolean);
+        if (modelIds.length === 0) return { ok: false, strategy: null, reason: '无可用模型' };
+
         // Try Bearer auth first (used by most aggregators like aiapikey.net, clawparrot, etc.),
         // then fall back to x-api-key (canonical Anthropic API).
         const styles = ['bearer', 'x-api-key'];
         const attempts = [];
-        for (const style of styles) {
-            const result = await doAnthropicHttpProbe(p, style);
-            attempts.push({ style, result });
-            console.log('[WebSearchProbe] Anthropic attempt', style, '→', JSON.stringify(result));
-            if (result.ok) {
-                return { ok: true, strategy: 'anthropic_native', hitCount: result.hitCount };
+        for (const modelId of modelIds) {
+            for (const style of styles) {
+                const result = await doAnthropicHttpProbe(p, style, modelId);
+                attempts.push({ style, modelId, result });
+                console.log('[WebSearchProbe] Anthropic attempt', style, 'model=' + modelId, '→', JSON.stringify(result));
+                if (result.ok) {
+                    return { ok: true, strategy: 'anthropic_native', hitCount: result.hitCount };
+                }
+                // If the error is model_not_found, skip to the next model
+                // (no point trying the other auth style for a missing model).
+                if (result.reason && /model.not.found|model.*not.*exist|no.*channel/i.test(result.reason)) {
+                    console.log('[WebSearchProbe] Model', modelId, 'not found on provider, trying next model');
+                    break;
+                }
             }
         }
-        // None of the styles succeeded — surface the most informative error
-        const bestFail = attempts.find(a => a.result.reason && !a.result.reason.includes('Network error'))
-            || attempts[0];
+        // None of the model+style combos succeeded — surface the most informative error
+        const bestFail = attempts.find(a => a.result.reason
+                && !a.result.reason.includes('Network error')
+                && !/model.not.found|no.*channel/i.test(a.result.reason))
+            || attempts[attempts.length - 1];
         return {
             ok: false,
             strategy: null,
-            reason: bestFail.result.reason || 'All auth styles failed',
+            reason: bestFail?.result?.reason || 'All model/auth combinations failed',
         };
     }
 
@@ -3374,7 +3413,7 @@ You have the following skills available. When a user's request matches a skill's
         const { modelId, apiKey, baseUrl, apiFormat, sysPrompt } = config;
         evictOldestEngine();
         const claudeDir = path.join(os.homedir(), '.claude');
-        const cliArgs = ['--preload', enginePreload, '--env-file=' + engineEnv, engineCli, '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose', '--include-partial-messages', '--permission-mode', 'bypassPermissions', '--add-dir', claudeDir, '--model', modelId];
+        const cliArgs = ['--preload', enginePreload, '--env-file=' + engineEnv, engineCli, '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose', '--include-partial-messages', '--permission-mode', 'bypassPermissions', '--permission-prompt-tool-name', 'stdio', '--add-dir', claudeDir, '--model', modelId];
         if (conv.claude_session_id) {
             cliArgs.push('--resume', conv.claude_session_id);
             // If a delete/edit/regenerate queued a rewind point, slice the resumed

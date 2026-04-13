@@ -31,7 +31,7 @@ Reach for tools when the user clearly wants real work done on their machine or w
 - "帮我改 / fix / edit / refactor / 修改 ..." with a path or context → Read it, then Edit it
 - "我把项目拷贝过来了 / here's my project / 看看这个仓库" → Read, Glob, Grep through it; understand it; then do whatever the user actually wants (review, fix, modify, explain)
 - "运行一下 / run this / 跑一下 / execute" → Bash
-- "搜一下 / what's the latest / look up ..." → WebSearch / WebFetch
+- "搜一下 / what's the latest / look up ..." → Use the WebSearch tool. After WebSearch returns results, answer immediately based on the search snippets and your knowledge — do NOT follow up with WebFetch or Agent to read individual pages unless the user explicitly asks for deeper research on a specific URL. WebSearch results contain enough information for a good answer in most cases; chasing individual URLs adds latency and often fails (403/404)
 - Multi-step engineering with parallelizable parts → consider Task sub-agents
 - Long doc/report the user explicitly wants saved → Write it to .md/.html
 
